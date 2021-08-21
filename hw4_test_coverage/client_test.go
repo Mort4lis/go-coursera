@@ -7,12 +7,15 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"net/http/httptest"
 	"net/url"
 	"os"
 	"reflect"
 	"sort"
 	"strconv"
 	"strings"
+	"testing"
+	"time"
 )
 
 type Paginator struct {
@@ -84,11 +87,11 @@ func (e *ServerError) Marshal() ([]byte, error) {
 }
 
 var (
-	errBadLimit      = NewServerError(http.StatusBadRequest, "ErrorBadLimit")
-	errBadOffset     = NewServerError(http.StatusBadRequest, "ErrorBadOffset")
-	errBadOrderBy    = NewServerError(http.StatusBadRequest, "ErrorBadOrderBy")
-	errBadOrderField = NewServerError(http.StatusBadRequest, "ErrorBadOrderField")
-
+	errBadLimit       = NewServerError(http.StatusBadRequest, "ErrorBadLimit")
+	errBadOffset      = NewServerError(http.StatusBadRequest, "ErrorBadOffset")
+	errBadOrderBy     = NewServerError(http.StatusBadRequest, "ErrorBadOrderBy")
+	errBadOrderField  = NewServerError(http.StatusBadRequest, "ErrorBadOrderField")
+	errUnauthorized   = NewServerError(http.StatusUnauthorized, "ErrorUnauthorized")
 	errInternalServer = NewServerError(http.StatusInternalServerError, "ErrorInternalServer")
 )
 
@@ -220,6 +223,11 @@ type ServerUser struct {
 }
 
 func SearchServer(w http.ResponseWriter, req *http.Request) {
+	if req.Header.Get("AccessToken") != "aGVsbG86d29ybGQ=" {
+		sendErrorJSONResponse(w, errUnauthorized)
+		return
+	}
+
 	extractor := QueryParamsExtractor{params: req.URL.Query()}
 	qParams, err := extractor.Extract()
 	if err != nil {
@@ -227,7 +235,22 @@ func SearchServer(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	users, err := getUsersFromFile("/home/mortalis/GoLandProjects/learn/go-coursera/hw4_test_coverage/dataset.xml", qParams)
+	switch qParams.Query {
+	case "__success_json_response":
+		sendInvalidJSONResponse(w, http.StatusOK)
+		return
+	case "__bad_json_response":
+		sendInvalidJSONResponse(w, http.StatusBadRequest)
+		return
+	case "__timeout":
+		time.Sleep(2 * time.Second)
+		fallthrough
+	case "__internal_server_err":
+		sendErrorJSONResponse(w, errInternalServer)
+		return
+	}
+
+	users, err := getUsersFromFile("./dataset.xml", qParams)
 	if err != nil {
 		log.Println(err)
 		sendErrorJSONResponse(w, errInternalServer)
@@ -273,10 +296,21 @@ func sendErrorJSONResponse(w http.ResponseWriter, err error) {
 	}
 }
 
+func sendInvalidJSONResponse(w http.ResponseWriter, statusCode int) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(statusCode)
+	_, err := w.Write([]byte(`[{`))
+	if err != nil {
+		log.Println(err)
+		return
+	}
+}
+
 func getUsers(reader io.Reader, qParams QueryParams) ([]*ServerUser, error) {
 	users := make([]*ServerUser, 0)
 	decoder := xml.NewDecoder(reader)
 
+	query := strings.ToLower(qParams.Query)
 	for {
 		token, err := decoder.Token()
 		if err == io.EOF {
@@ -295,7 +329,7 @@ func getUsers(reader io.Reader, qParams QueryParams) ([]*ServerUser, error) {
 				}
 
 				user.Name = fmt.Sprintf("%s %s", user.FirstName, user.LastName)
-				if qParams.Query != "" && !filterUser(user, qParams.Query) {
+				if query != "" && !filterUser(user, query) {
 					continue
 				}
 
@@ -322,7 +356,10 @@ func getUsersFromFile(filepath string, qParams QueryParams) ([]*ServerUser, erro
 }
 
 func filterUser(user *ServerUser, query string) bool {
-	return strings.Contains(user.Name, query) || strings.Contains(user.About, query)
+	name := strings.ToLower(user.Name)
+	about := strings.ToLower(user.About)
+
+	return strings.Contains(name, query) || strings.Contains(about, query)
 }
 
 type SortFunc func(i, j int) bool
@@ -351,4 +388,88 @@ func getSortFunc(users []*ServerUser, orderField string, orderBy int) SortFunc {
 	}
 
 	return nil
+}
+
+type TestCase struct {
+	QueryParams SearchRequest
+	IsError     bool
+}
+
+func TestFindUsers(t *testing.T) {
+	testCases := []TestCase{
+		{
+			QueryParams: SearchRequest{Query: "lorem a"},
+		},
+		{
+			QueryParams: SearchRequest{Query: "lorem a", Limit: 20},
+		},
+		{
+			QueryParams: SearchRequest{Limit: 100},
+		},
+		{
+			QueryParams: SearchRequest{Limit: -1},
+			IsError:     true,
+		},
+		{
+			QueryParams: SearchRequest{Offset: -1},
+			IsError:     true,
+		},
+		{
+			QueryParams: SearchRequest{OrderBy: 10},
+			IsError:     true,
+		},
+		{
+			QueryParams: SearchRequest{OrderField: "UnknownField"},
+			IsError:     true,
+		},
+		{
+			QueryParams: SearchRequest{Query: "__success_json_response"},
+			IsError:     true,
+		},
+		{
+			QueryParams: SearchRequest{Query: "__bad_json_response"},
+			IsError:     true,
+		},
+		{
+			QueryParams: SearchRequest{Query: "__timeout"},
+			IsError:     true,
+		},
+		{
+			QueryParams: SearchRequest{Query: "__internal_server_err"},
+			IsError:     true,
+		},
+	}
+
+	server := httptest.NewServer(http.HandlerFunc(SearchServer))
+	client := &SearchClient{
+		URL:         server.URL,
+		AccessToken: "aGVsbG86d29ybGQ=",
+	}
+
+	for testNum, testCase := range testCases {
+		_, err := client.FindUsers(testCase.QueryParams)
+
+		if testCase.IsError && err == nil {
+			t.Errorf("[testcase %d]: got nil, expected error", testNum)
+		}
+		if !testCase.IsError && err != nil {
+			t.Errorf("[testcase %d]: unexpected error %v", testNum, err)
+		}
+	}
+}
+
+func TestFindUserUnauthorized(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(SearchServer))
+	client := &SearchClient{URL: server.URL}
+
+	if _, err := client.FindUsers(SearchRequest{Query: "tim"}); err == nil {
+		t.Errorf("got nil, expected error")
+	}
+}
+
+func TestFindUserBadURL(t *testing.T) {
+	client := &SearchClient{URL: "http://localhost:100", AccessToken: "aGVsbG86d29ybGQ="}
+	if _, err := client.FindUsers(SearchRequest{Query: "tim"}); err == nil {
+		t.Errorf("got nil, expected error")
+	}
 }

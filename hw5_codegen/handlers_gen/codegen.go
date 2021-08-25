@@ -22,7 +22,7 @@ type GenAPIParams struct {
 }
 
 func (p *GenAPIParams) Validate() error {
-	if _, err := url.Parse(p.URL); err != nil {
+	if _, err := url.ParseRequestURI(p.URL); err != nil {
 		return err
 	}
 

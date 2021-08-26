@@ -40,14 +40,14 @@ func (p *GenAPIParams) Validate() error {
 	return nil
 }
 
-type APIMethod struct {
+type WrapperMethod struct {
 	fd      *ast.FuncDecl
 	params  GenAPIParams
 	recName string
 	recType string
 }
 
-func NewAPIMethod(fd *ast.FuncDecl, params GenAPIParams) (*APIMethod, error) {
+func NewWrapperMethod(fd *ast.FuncDecl, params GenAPIParams) (*WrapperMethod, error) {
 	if fd.Recv == nil {
 		return nil, fmt.Errorf("except method with receiver, got function")
 	}
@@ -68,7 +68,7 @@ func NewAPIMethod(fd *ast.FuncDecl, params GenAPIParams) (*APIMethod, error) {
 		return nil, fmt.Errorf("receiver type must be present as an identifier")
 	}
 
-	return &APIMethod{
+	return &WrapperMethod{
 		fd:      fd,
 		params:  params,
 		recName: identName.Name,
@@ -76,43 +76,43 @@ func NewAPIMethod(fd *ast.FuncDecl, params GenAPIParams) (*APIMethod, error) {
 	}, nil
 }
 
-func (am *APIMethod) ReceiverName() string {
-	return am.recName
+func (wm *WrapperMethod) ReceiverName() string {
+	return wm.recName
 }
 
-func (am *APIMethod) ReceiverType() string {
-	return am.recType
+func (wm *WrapperMethod) ReceiverType() string {
+	return wm.recType
 }
 
 type ServeHTTPMethod struct {
-	methods []*APIMethod
-	recName string
-	recType string
+	wrappers []*WrapperMethod
+	recName  string
+	recType  string
 }
 
-func CreateFromAPIMethod(m *APIMethod) *ServeHTTPMethod {
-	methods := make([]*APIMethod, 0, 1)
-	methods = append(methods, m)
+func CreateFromAPIMethod(method *WrapperMethod) *ServeHTTPMethod {
+	wrappers := make([]*WrapperMethod, 0, 1)
+	wrappers = append(wrappers, method)
 	return &ServeHTTPMethod{
-		methods: methods,
-		recName: m.recName,
-		recType: m.recType,
+		wrappers: wrappers,
+		recName:  method.recName,
+		recType:  method.recType,
 	}
 }
 
-func (sm *ServeHTTPMethod) RelateMethod(am *APIMethod) error {
-	if sm.recName != am.ReceiverName() {
+func (sm *ServeHTTPMethod) RelateMethod(method *WrapperMethod) error {
+	if sm.recName != method.ReceiverName() {
 		return fmt.Errorf("failed to relate api method with serve http method due mismatch receiver name")
 	}
-	if sm.recType != am.ReceiverType() {
+	if sm.recType != method.ReceiverType() {
 		return fmt.Errorf("failed to relate api method due with serve http method mismatch receiver type")
 	}
 
-	sm.methods = append(sm.methods, am)
+	sm.wrappers = append(sm.wrappers, method)
 	return nil
 }
 
-func (sm *ServeHTTPMethod) GenerateTo(out io.Writer) {
+func (sm *ServeHTTPMethod) Render(out io.Writer) {
 	_, _ = fmt.Fprintf(out, "func (%s *%s) ServeHTTP(w http.ResponseWriter, req *http.Request) {\n", sm.recName, sm.recType)
 	_, _ = fmt.Fprintln(out, "\t // handler body")
 	_, _ = fmt.Fprintln(out, "}")
@@ -200,22 +200,22 @@ func main() {
 			log.Fatal(err)
 		}
 
-		apiMethod, err := NewAPIMethod(fd, *genParams)
+		wrapper, err := NewWrapperMethod(fd, *genParams)
 		if err != nil {
 			log.Fatal(err)
 		}
 
-		if serveMethod, exist := serveMethods[apiMethod.ReceiverType()]; exist {
-			if err = serveMethod.RelateMethod(apiMethod); err != nil {
+		if serveMethod, exist := serveMethods[wrapper.ReceiverType()]; exist {
+			if err = serveMethod.RelateMethod(wrapper); err != nil {
 				log.Fatal(err)
 			}
 		} else {
-			serveMethod = CreateFromAPIMethod(apiMethod)
-			serveMethods[apiMethod.ReceiverType()] = serveMethod
+			serveMethod = CreateFromAPIMethod(wrapper)
+			serveMethods[wrapper.ReceiverType()] = serveMethod
 		}
 	}
 
 	for _, serveMethod := range serveMethods {
-		serveMethod.GenerateTo(out)
+		serveMethod.Render(out)
 	}
 }

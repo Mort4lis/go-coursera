@@ -15,6 +15,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"text/template"
 )
 
 type GenSettings struct {
@@ -60,7 +61,7 @@ var binaryLabels = map[string]bool{
 	labelMax:       true,
 }
 
-type APITagParser struct {
+type TagParser struct {
 	Raw string
 
 	isRequired bool
@@ -71,7 +72,7 @@ type APITagParser struct {
 	max        int
 }
 
-func (p *APITagParser) Parse() error {
+func (p *TagParser) Parse() error {
 	labels := strings.Split(p.Raw, ",")
 	for _, label := range labels {
 		if label == "" {
@@ -116,27 +117,27 @@ func (p *APITagParser) Parse() error {
 	return nil
 }
 
-func (p *APITagParser) IsRequired() bool {
+func (p *TagParser) IsRequired() bool {
 	return p.isRequired
 }
 
-func (p *APITagParser) ParamName() string {
+func (p *TagParser) ParamName() string {
 	return p.paramName
 }
 
-func (p *APITagParser) Enum() []string {
+func (p *TagParser) Enum() []string {
 	return p.enums
 }
 
-func (p *APITagParser) Default() string {
+func (p *TagParser) Default() string {
 	return p.defaultVal
 }
 
-func (p *APITagParser) Min() int {
+func (p *TagParser) Min() int {
 	return p.min
 }
 
-func (p *APITagParser) Max() int {
+func (p *TagParser) Max() int {
 	return p.max
 }
 
@@ -144,33 +145,106 @@ type Renderer interface {
 	Render(out io.Writer) error
 }
 
-type SetStrField struct {
-	fieldName string
-	paramName string
+var funcMap = template.FuncMap{
+	"lower": strings.ToLower,
 }
 
-func (f SetStrField) Render(out io.Writer) error {
-	tmpVarName := strings.ToLower(f.fieldName)
-	_, _ = fmt.Fprintln(out)
-	_, _ = fmt.Fprintf(out, "\t%sStr := req.FormValue(%q)\n", tmpVarName, f.paramName)
-	_, _ = fmt.Fprintf(out, "\tparams.%s = %sStr\n", f.fieldName, tmpVarName)
-	return nil
+var (
+	fieldSetterStrTmpl = template.Must(template.New("fieldSetterStrTmpl").Funcs(funcMap).Parse(`
+	{{.FieldName|lower}}Str := req.FormValue("{{.ParamName}}")
+	params.{{.FieldName}} = {{.FieldName|lower}}Str
+`))
+
+	fieldSetterIntTmpl = template.Must(template.New("fieldSetterIntTmpl").Funcs(funcMap).Parse(`
+	{{.FieldName|lower}}Str := req.FormValue("{{.ParamName}}")
+	{{.FieldName|lower}}Int, err := strconv.Atoi({{.FieldName|lower}}Str)
+	if err != nil {
+    }
+	params.{{.FieldName}} = {{.FieldName|lower}}Int
+`))
+
+	defaultFieldSetterStrTmpl = template.Must(template.New("defaultFieldSetterStrTmpl").Funcs(funcMap).Parse(`
+	if params.{{.FieldName}} == "" {
+		params.{{.FieldName}} = "{{.DefaultVal}}"
+	}
+`))
+
+	defaultFieldSetterIntTmpl = template.Must(template.New("defaultFieldSetterIntTmpl").Funcs(funcMap).Parse(`
+	if params.{{.FieldName}} == 0 {
+		params.{{.FieldName}} = {{.DefaultVal}}
+	}
+`))
+)
+
+type FieldSetterStr struct {
+	FieldName string
+	ParamName string
 }
 
-type SetIntField struct {
-	SetStrField
+func (f FieldSetterStr) Render(out io.Writer) error {
+	return fieldSetterStrTmpl.Execute(out, f)
 }
 
-func (f SetIntField) Render(out io.Writer) error {
-	tmpVarName := strings.ToLower(f.fieldName)
-	_, _ = fmt.Fprintln(out)
-	_, _ = fmt.Fprintf(out, "\t%sStr := req.FormValue(%q)\n", tmpVarName, f.paramName)
-	_, _ = fmt.Fprintf(out, "\t%sInt, err := strconv.Atoi(%sStr)\n", tmpVarName, tmpVarName)
-	_, _ = fmt.Fprintln(out, "\tif err != nil {")
-	_, _ = fmt.Fprintln(out, "\t}")
-	_, _ = fmt.Fprintf(out, "\tparams.%s = %sInt\n", f.fieldName, tmpVarName)
-	return nil
+type FieldSetterInt struct {
+	FieldSetterStr
 }
+
+func (f FieldSetterInt) Render(out io.Writer) error {
+	return fieldSetterIntTmpl.Execute(out, f)
+}
+
+type DefaultFieldSetterStr struct {
+	FieldName  string
+	DefaultVal string
+}
+
+func (f DefaultFieldSetterStr) Render(out io.Writer) error {
+	return defaultFieldSetterStrTmpl.Execute(out, f)
+}
+
+type DefaultFieldSetterInt struct {
+	DefaultFieldSetterStr
+}
+
+func (f DefaultFieldSetterInt) Render(out io.Writer) error {
+	return defaultFieldSetterIntTmpl.Execute(out, f)
+}
+
+type RendererFactory struct{}
+
+func (f RendererFactory) GetFieldSetter(dataType, fieldName, paramName string) (Renderer, error) {
+	fs := FieldSetterStr{
+		FieldName: fieldName,
+		ParamName: paramName,
+	}
+
+	switch dataType {
+	case "string":
+		return fs, nil
+	case "int":
+		return FieldSetterInt{FieldSetterStr: fs}, nil
+	default:
+		return nil, fmt.Errorf("unknown type %s", dataType)
+	}
+}
+
+func (f RendererFactory) GetDefaultFieldSetter(dataType, fieldName, defaultVal string) (Renderer, error) {
+	fs := DefaultFieldSetterStr{
+		FieldName:  fieldName,
+		DefaultVal: defaultVal,
+	}
+
+	switch dataType {
+	case "string":
+		return fs, nil
+	case "int":
+		return DefaultFieldSetterInt{DefaultFieldSetterStr: fs}, nil
+	default:
+		return nil, fmt.Errorf("unknown type %s", dataType)
+	}
+}
+
+var rendererFactory = RendererFactory{}
 
 type WrapperMethod struct {
 	settings GenSettings
@@ -270,48 +344,44 @@ func (wm *WrapperMethod) Render(out io.Writer) error {
 	for _, field := range wm.structType.Fields.List {
 		fieldType, ok := field.Type.(*ast.Ident)
 		if !ok {
-			// TODO: handle error
+			return fmt.Errorf("field(s) %s of struct %s must be present as an identifier", field.Names, wm.structName)
 		}
 
-		tagParser := new(APITagParser)
+		tagParser := new(TagParser)
 		if field.Tag != nil {
 			structTag := reflect.StructTag(field.Tag.Value[1 : len(field.Tag.Value)-1])
 			tagParser.Raw = structTag.Get("apivalidator")
 		}
 
 		if err := tagParser.Parse(); err != nil {
-			// TODO: handle error
+			return err
 		}
 
+		chain := make([]Renderer, 0, 1)
 		for _, fieldName := range field.Names {
 			paramName := tagParser.ParamName()
 			if paramName == "" {
 				paramName = strings.ToLower(fieldName.Name)
 			}
 
-			// TODO: создать функцию makeChain, которая будет содержать всю логику для добавления элементов в цепочку
-			chain := make([]Renderer, 0)
-			switch fieldType.Name {
-			case "string":
-				chain = append(chain, SetStrField{
-					fieldName: fieldName.Name,
-					paramName: paramName,
-				})
-			case "int":
-				chain = append(chain, SetIntField{
-					SetStrField: SetStrField{
-						fieldName: fieldName.Name,
-						paramName: paramName,
-					},
-				})
-			default:
-				// TODO: handle error
+			el, err := rendererFactory.GetFieldSetter(fieldType.Name, fieldName.Name, paramName)
+			if err != nil {
+				return fmt.Errorf("failed to get field setter due %v", err)
 			}
+			chain = append(chain, el)
 
-			for _, renderElem := range chain {
-				if err := renderElem.Render(out); err != nil {
-					// TODO: handle error
+			if defaultVal := tagParser.Default(); defaultVal != "" {
+				el, err := rendererFactory.GetDefaultFieldSetter(fieldType.Name, fieldName.Name, defaultVal)
+				if err != nil {
+					return fmt.Errorf("failed to get default field setter due %v", err)
 				}
+				chain = append(chain, el)
+			}
+		}
+
+		for _, el := range chain {
+			if err := el.Render(out); err != nil {
+				return err
 			}
 		}
 	}
@@ -408,6 +478,7 @@ func main() {
 	_, _ = fmt.Fprintln(out)
 	_, _ = fmt.Fprintln(out, "import (")
 	_, _ = fmt.Fprintln(out, "\t"+`"net/http"`)
+	_, _ = fmt.Fprintln(out, "\t"+`"strconv"`)
 	_, _ = fmt.Fprintln(out, ")")
 	_, _ = fmt.Fprintln(out)
 

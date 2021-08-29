@@ -66,10 +66,16 @@ type TagParser struct {
 
 	isRequired bool
 	paramName  string
-	enums      []string
+	enum       []string
 	defaultVal string
 	min        int
 	max        int
+
+	hasParamName bool
+	hasEnum      bool
+	hasDefault   bool
+	hasMin       bool
+	hasMax       bool
 }
 
 func (p *TagParser) Parse() error {
@@ -96,10 +102,13 @@ func (p *TagParser) Parse() error {
 			p.isRequired = true
 		case labelParamName:
 			p.paramName = value
+			p.hasParamName = true
 		case labelEnum:
-			p.enums = strings.Split(value, "|")
+			p.enum = strings.Split(value, "|")
+			p.hasEnum = true
 		case labelDefault:
 			p.defaultVal = value
+			p.hasDefault = true
 		case labelMin, labelMax:
 			val, err := strconv.Atoi(value)
 			if err != nil {
@@ -108,8 +117,10 @@ func (p *TagParser) Parse() error {
 
 			if key == labelMin {
 				p.min = val
+				p.hasMin = true
 			} else {
 				p.max = val
+				p.hasMax = true
 			}
 		}
 	}
@@ -126,7 +137,7 @@ func (p *TagParser) ParamName() string {
 }
 
 func (p *TagParser) Enum() []string {
-	return p.enums
+	return p.enum
 }
 
 func (p *TagParser) Default() string {
@@ -139,6 +150,26 @@ func (p *TagParser) Min() int {
 
 func (p *TagParser) Max() int {
 	return p.max
+}
+
+func (p *TagParser) HasParamName() bool {
+	return p.hasParamName
+}
+
+func (p *TagParser) HasEnum() bool {
+	return p.hasEnum
+}
+
+func (p *TagParser) HasDefault() bool {
+	return p.hasDefault
+}
+
+func (p *TagParser) HasMin() bool {
+	return p.hasMin
+}
+
+func (p *TagParser) HasMax() bool {
+	return p.hasMax
 }
 
 type Renderer interface {
@@ -524,20 +555,20 @@ func (wm *WrapperMethod) Render(out io.Writer) error {
 			}
 
 			chain = append(chain, FieldSetter{fieldType.Name, fieldName.Name, paramName})
-			if defaultVal := tagParser.Default(); defaultVal != "" {
-				chain = append(chain, DefaultFieldSetter{fieldType.Name, fieldName.Name, defaultVal})
+			if tagParser.HasDefault() {
+				chain = append(chain, DefaultFieldSetter{fieldType.Name, fieldName.Name, tagParser.Default()})
 			}
 			if tagParser.IsRequired() {
 				chain = append(chain, RequiredValidator{fieldType.Name, fieldName.Name})
 			}
-			if enum := tagParser.Enum(); len(enum) != 0 {
+			if tagParser.HasEnum() {
 				chain = append(chain, EnumValidator{fieldType.Name, fieldName.Name, tagParser.Enum()})
 			}
-			if minVal := tagParser.Min(); minVal != 0 {
-				chain = append(chain, MinValidator{fieldType.Name, fieldName.Name, minVal})
+			if tagParser.HasMin() {
+				chain = append(chain, MinValidator{fieldType.Name, fieldName.Name, tagParser.Min()})
 			}
-			if maxVal := tagParser.Max(); maxVal != 0 {
-				chain = append(chain, MaxValidator{fieldType.Name, fieldName.Name, maxVal})
+			if tagParser.HasMax() {
+				chain = append(chain, MaxValidator{fieldType.Name, fieldName.Name, tagParser.Max()})
 			}
 		}
 
@@ -552,8 +583,8 @@ func (wm *WrapperMethod) Render(out io.Writer) error {
 	_, _ = fmt.Fprintln(out, `	if err != nil {
 		if err = respondError(w, err); err != nil {
 			log.Println(err)
-			return
 		}
+		return
 	}
 	
 	body := ResponseBody{Response: res}
@@ -561,8 +592,8 @@ func (wm *WrapperMethod) Render(out io.Writer) error {
 	if err != nil {
 		if err = respondError(w, err); err != nil {
 			log.Println(err)
-			return
 		}
+		return
 	}
 
 	w.Header().Set("Content-Type", "application/json")

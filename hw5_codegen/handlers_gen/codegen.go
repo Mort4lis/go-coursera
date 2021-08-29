@@ -283,6 +283,11 @@ func ({{.ReceiverName}} *{{.ReceiverType}}) ServeHTTP(w http.ResponseWriter, req
 		{{end}}
 		{{.ReceiverName}}.{{.Name}}(w, req)
 	{{end}}
+	default:
+		err := fmt.Errorf("unknown method")
+		if err = respondError(w, ApiError{http.StatusNotFound, err}); err != nil {
+			log.Println(err)
+		}
 	}
 }
 `))

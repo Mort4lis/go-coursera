@@ -483,6 +483,17 @@ func (wm *WrapperMethod) Render(out io.Writer) error {
 		wm.recName, wm.recType, wm.Name(),
 	)
 
+	if wm.Settings.Auth {
+		_, _ = fmt.Fprintln(out, "\t"+`if req.Header.Get("X-Auth") != "100500" {
+		err := fmt.Errorf("unauthorized")
+		if err = respondError(w, ApiError{http.StatusForbidden, err}); err != nil {
+			log.Println(err)
+		}
+		return
+	}
+	`)
+	}
+
 	_, _ = fmt.Fprintf(out, "\tparams := %s{}\n", wm.structName)
 	for _, field := range wm.structType.Fields.List {
 		fieldType, ok := field.Type.(*ast.Ident)

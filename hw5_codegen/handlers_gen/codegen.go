@@ -627,9 +627,7 @@ func RenderRespondErrorFunc(out io.Writer) error {
 	_, err := out.Write([]byte(`
 func respondError(w http.ResponseWriter, err error) error {
 	if apiErr, ok := err.(ApiError); ok {
-		view := struct {
-			Error string ` + "`json:\"error\"`" + `
-		}{apiErr.Err.Error()}
+		view := ResponseBody{Error: apiErr.Err.Error()}
 
 		payload, err := json.Marshal(view)
 		if err != nil {

@@ -484,9 +484,24 @@ func (wm *WrapperMethod) parseArguments() error {
 		return fmt.Errorf("len of method arguments must be equal 2")
 	}
 
-	_, structArg := args[0], args[1]
+	ctxArg, structArg := args[0], args[1]
 
-	// TODO: check the first argument (must be a context)
+	selExpr, ok := ctxArg.Type.(*ast.SelectorExpr)
+	if !ok {
+		return fmt.Errorf("first argument must be present as a selector expression")
+	}
+
+	e, ok := selExpr.X.(*ast.Ident)
+	if !ok {
+		return fmt.Errorf("first argument must be present as a selector expression")
+	}
+
+	if e.Name != "context" {
+		return fmt.Errorf("first argument must be a context.Context")
+	}
+	if selExpr.Sel.Name != "Context" {
+		return fmt.Errorf("first argument must be a context.Context")
+	}
 
 	ident, ok := structArg.Type.(*ast.Ident)
 	if !ok {
@@ -570,11 +585,11 @@ func (wm *WrapperMethod) Render(out io.Writer) error {
 			if tagParser.HasMax() {
 				chain = append(chain, MaxValidator{fieldType.Name, fieldName.Name, tagParser.Max()})
 			}
-		}
 
-		for _, el := range chain {
-			if err := el.Render(out); err != nil {
-				return err
+			for _, el := range chain {
+				if err := el.Render(out); err != nil {
+					return fmt.Errorf("failed to render %T component (field=%q) due %v", el, fieldName.Name, err)
+				}
 			}
 		}
 	}
@@ -701,31 +716,21 @@ func respondError(w http.ResponseWriter, err error) error {
 	return err
 }
 
-func exitWithMessage(msg string) {
-	_, wErr := fmt.Fprintln(os.Stderr, msg)
-	if wErr != nil {
-		log.Fatal(wErr)
-	}
-	os.Exit(1)
-}
-
 func main() {
 	if len(os.Args) != 3 {
-		exitWithMessage("usage: ./codegen <source_file> <destination_file>")
+		log.Fatal("usage: ./codegen <source_file> <destination_file>")
 	}
 
 	fset := token.NewFileSet()
 	srcFilePath, dstFilePath := os.Args[1], os.Args[2]
 	in, err := parser.ParseFile(fset, srcFilePath, nil, parser.ParseComments)
 	if err != nil {
-		log.Println(err)
-		exitWithMessage(fmt.Sprintf("failed to parse file %s", srcFilePath))
+		log.Fatalf("failed to parse file %s due %v", srcFilePath, err)
 	}
 
 	out, err := os.Create(dstFilePath)
 	if err != nil {
-		log.Println(err)
-		exitWithMessage(fmt.Sprintf("failed to create destination file %s", dstFilePath))
+		log.Fatalf("failed to create destination file %s due %v", dstFilePath, err)
 	}
 
 	_, _ = fmt.Fprintln(out, "package "+in.Name.Name)
@@ -739,7 +744,9 @@ import (
 )`)
 	_, _ = fmt.Fprintln(out)
 
-	RendererFunc(RenderResponseBodyStruct).Renderer(out)
+	if err = RendererFunc(RenderResponseBodyStruct).Renderer(out); err != nil {
+		log.Fatalf("failed to render ResponseBody struct due %v", err)
+	}
 
 	pattern := regexp.MustCompile(`^\/\/\s*apigen:api\s+({.+})$`)
 	serveMethods := make(map[string]*ServeHTTPMethod)
@@ -773,16 +780,16 @@ import (
 
 		settings := new(GenSettings)
 		if err = json.Unmarshal([]byte(genPayload), settings); err != nil {
-			log.Fatal(err)
+			log.Fatalf("failed to unmarshal apigen settings %q due %v", genPayload, err)
 		}
 
 		if err = settings.Validate(); err != nil {
-			log.Fatal(err)
+			log.Fatalf("apigen settings validation due %v", err)
 		}
 
 		wrapper, err := NewWrapperMethod(fd, *settings)
 		if err != nil {
-			log.Fatal(err)
+			log.Fatalf("failed to create wrapper method component %q due %v", fd.Name.Name, err)
 		}
 
 		if serveMethod, exist := serveMethods[wrapper.ReceiverType()]; exist {
@@ -794,12 +801,18 @@ import (
 			serveMethods[wrapper.ReceiverType()] = serveMethod
 		}
 
-		wrapper.Render(out)
+		if err = wrapper.Render(out); err != nil {
+			log.Fatalf("failed to render wrapper method %q due %v", wrapper.Name(), err)
+		}
 	}
 
-	RendererFunc(RenderRespondErrorFunc).Renderer(out)
+	if err = RendererFunc(RenderRespondErrorFunc).Renderer(out); err != nil {
+		log.Fatalf("failed to render respondError function due %v", err)
+	}
 
 	for _, serveMethod := range serveMethods {
-		serveMethod.Render(out)
+		if err = serveMethod.Render(out); err != nil {
+			log.Fatalf("failed to render serveHTTP method (receiver = %q) due %v", serveMethod.ReceiverType(), err)
+		}
 	}
 }

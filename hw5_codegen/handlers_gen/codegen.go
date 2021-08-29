@@ -496,10 +496,7 @@ func (wm *WrapperMethod) parseArguments() error {
 		return fmt.Errorf("first argument must be present as a selector expression")
 	}
 
-	if e.Name != "context" {
-		return fmt.Errorf("first argument must be a context.Context")
-	}
-	if selExpr.Sel.Name != "Context" {
+	if e.Name != "context" || selExpr.Sel.Name != "Context" {
 		return fmt.Errorf("first argument must be a context.Context")
 	}
 

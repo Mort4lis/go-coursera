@@ -147,9 +147,42 @@ type Renderer interface {
 
 var funcMap = template.FuncMap{
 	"lower": strings.ToLower,
+	"sliceToStr": func(sl []string) string {
+		return fmt.Sprintf("[%s]", strings.Join(sl, ", "))
+	},
 }
 
 var (
+	respondErrorFuncTmpl = template.Must(template.New("respondErrorFuncTmpl").Parse(`
+func respondError(w http.ResponseWriter, err error) error {
+	if apiErr, ok := err.(ApiError); ok {
+		view := struct {
+			Error string ` + "`json:\"error\"`" + `
+		}{apiErr.Err.Error()}
+
+		payload, err := json.Marshal(view)
+		if err != nil {
+			return fmt.Errorf("failed to marshal error due %v", err)
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(apiErr.HTTPStatus)
+		_, err = w.Write(payload)
+		if err != nil {
+			return fmt.Errorf("failed to write response body due %v", err)
+		}
+
+		return nil
+	}
+
+	return respondError(w, ApiError{
+		HTTPStatus: http.StatusInternalServerError,
+		Err:        err,
+	})
+}
+
+`))
+
 	fieldSetterStrTmpl = template.Must(template.New("fieldSetterStrTmpl").Funcs(funcMap).Parse(`
 	{{.FieldName|lower}}Str := req.FormValue("{{.ParamName}}")
 	params.{{.FieldName}} = {{.FieldName|lower}}Str
@@ -158,7 +191,10 @@ var (
 	{{.FieldName|lower}}Str := req.FormValue("{{.ParamName}}")
 	{{.FieldName|lower}}Int, err := strconv.Atoi({{.FieldName|lower}}Str)
 	if err != nil {
-		// handle error
+		err = fmt.Errorf("{{.FieldName|lower}} must be int")
+		if err = respondError(w, ApiError{http.StatusBadRequest, err}); err != nil {
+			log.Println(err)
+		}
 		return
     }
 	params.{{.FieldName}} = {{.FieldName|lower}}Int
@@ -175,58 +211,82 @@ var (
 	}
 `))
 
-	requiredStrValidatorTmpl = template.Must(template.New("requiredStrValidatorTmpl").Parse(`
+	requiredStrValidatorTmpl = template.Must(template.New("requiredStrValidatorTmpl").Funcs(funcMap).Parse(`
 	if params.{{.FieldName}} == "" {
-		// handle error
+		err := fmt.Errorf("{{.FieldName|lower}} must me not empty")
+		if err = respondError(w, ApiError{http.StatusBadRequest, err}); err != nil {
+			log.Println(err)
+		}
 		return
 	}
 `))
-	requiredIntValidatorTmpl = template.Must(template.New("requiredIntValidatorTmpl").Parse(`
+	requiredIntValidatorTmpl = template.Must(template.New("requiredIntValidatorTmpl").Funcs(funcMap).Parse(`
 	if params.{{.FieldName}} == 0 {
-		// handle error
+		err := fmt.Errorf("{{.FieldName|lower}} must me not empty")
+		if err = respondError(w, ApiError{http.StatusBadRequest, err}); err != nil {
+			log.Println(err)
+		}
 		return
 	}
 `))
 
-	enumStrValidatorTmpl = template.Must(template.New("enumStrValidatorTmpl").Parse(`
+	enumStrValidatorTmpl = template.Must(template.New("enumStrValidatorTmpl").Funcs(funcMap).Parse(`
 	switch params.{{.FieldName}} {
 	case {{range $i, $el := .Enum}}{{if (ne $i 0)}}, {{end}}"{{$el}}"{{end}}:
 	default:
-		// handle error
+		err := fmt.Errorf("{{.FieldName|lower}} must be one of {{.Enum|sliceToStr}}")
+		if err = respondError(w, ApiError{http.StatusBadRequest, err}); err != nil {
+			log.Println(err)
+		}
 		return
 	}
 `))
-	enumIntValidatorTmpl = template.Must(template.New("enumIntValidatorTmpl").Parse(`
+	enumIntValidatorTmpl = template.Must(template.New("enumIntValidatorTmpl").Funcs(funcMap).Parse(`
 	switch params.{{.FieldName}} {
 	case {{range $i, $el := .Enum}}{{if (ne $i 0)}}, {{end}}{{$el}}{{end}}:
 	default:
-		// handle error
+		err := fmt.Errorf("{{.FieldName|lower}} must be one of {{.Enum|sliceToStr}}")
+		if err = respondError(w, ApiError{http.StatusBadRequest, err}); err != nil {
+			log.Println(err)
+		}
 		return
 	}
 `))
 
-	minStrValidatorTmpl = template.Must(template.New("minStrValidatorTmpl").Parse(`
+	minStrValidatorTmpl = template.Must(template.New("minStrValidatorTmpl").Funcs(funcMap).Parse(`
 	if len(params.{{.FieldName}}) < {{.MinValue}} {
-		// handle error
+		err := fmt.Errorf("{{.FieldName|lower}} len must be >= {{.MinValue}}")
+		if err = respondError(w, ApiError{http.StatusBadRequest, err}); err != nil {
+			log.Println(err)
+		}
 		return
 	}
 `))
-	minIntValidatorTmpl = template.Must(template.New("minIntValidatorTmpl").Parse(`
+	minIntValidatorTmpl = template.Must(template.New("minIntValidatorTmpl").Funcs(funcMap).Parse(`
 	if params.{{.FieldName}} < {{.MinValue}} {
-		// handle error
+		err := fmt.Errorf("{{.FieldName|lower}} must be >= {{.MinValue}}")
+		if err = respondError(w, ApiError{http.StatusBadRequest, err}); err != nil {
+			log.Println(err)
+		}
 		return
 	}
 `))
 
-	maxStrValidatorTmpl = template.Must(template.New("maxStrValidatorTmpl").Parse(`
+	maxStrValidatorTmpl = template.Must(template.New("maxStrValidatorTmpl").Funcs(funcMap).Parse(`
 	if len(params.{{.FieldName}}) > {{.MaxValue}} {
-		// handle error
+		err := fmt.Errorf("{{.FieldName|lower}} len must be <= {{.MaxValue}}")
+		if err = respondError(w, ApiError{http.StatusBadRequest, err}); err != nil {
+			log.Println(err)
+		}
 		return
 	}
 `))
-	maxIntValidatorTmpl = template.Must(template.New("maxIntValidatorTmpl").Parse(`
+	maxIntValidatorTmpl = template.Must(template.New("maxIntValidatorTmpl").Funcs(funcMap).Parse(`
 	if params.{{.FieldName}} > {{.MaxValue}} {
-		// handle error
+		err := fmt.Errorf("{{.FieldName|lower}} must be <= {{.MaxValue}}")
+		if err = respondError(w, ApiError{http.StatusBadRequest, err}); err != nil {
+			log.Println(err)
+		}
 		return
 	}
 `))
@@ -537,6 +597,12 @@ func (sm *ServeHTTPMethod) ReceiverType() string {
 	return sm.recType
 }
 
+type RespondErrorFunc struct{}
+
+func (f RespondErrorFunc) Render(out io.Writer) error {
+	return respondErrorFuncTmpl.Execute(out, f)
+}
+
 func exitWithMessage(msg string) {
 	_, wErr := fmt.Fprintln(os.Stderr, msg)
 	if wErr != nil {
@@ -565,11 +631,14 @@ func main() {
 	}
 
 	_, _ = fmt.Fprintln(out, "package "+in.Name.Name)
-	_, _ = fmt.Fprintln(out)
-	_, _ = fmt.Fprintln(out, "import (")
-	_, _ = fmt.Fprintln(out, "\t"+`"net/http"`)
-	_, _ = fmt.Fprintln(out, "\t"+`"strconv"`)
-	_, _ = fmt.Fprintln(out, ")")
+	_, _ = fmt.Fprintln(out, `
+import (
+	"encoding/json"
+	"fmt"
+	"log"
+	"net/http"
+	"strconv"
+)`)
 	_, _ = fmt.Fprintln(out)
 
 	pattern := regexp.MustCompile(`^\/\/\s*apigen:api\s+({.+})$`)
@@ -627,6 +696,8 @@ func main() {
 
 		wrapper.Render(out)
 	}
+
+	RespondErrorFunc{}.Render(out)
 
 	for _, serveMethod := range serveMethods {
 		serveMethod.Render(out)

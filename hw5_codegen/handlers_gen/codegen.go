@@ -266,6 +266,26 @@ var (
 		return
 	}
 `))
+
+	serveHTTPMethodTmpl = template.Must(template.New("serveHTTPMethodTmpl").Parse(`
+func ({{.ReceiverName}} *{{.ReceiverType}}) ServeHTTP(w http.ResponseWriter, req *http.Request) {
+	switch req.URL.Path {
+	{{range .Wrappers}}
+	case "{{.Settings.URL}}":
+		{{if (ne .Settings.Method "")}}
+		if req.Method != "{{.Settings.Method}}" {
+			err := fmt.Errorf("bad method")
+			if err = respondError(w, ApiError{http.StatusNotAcceptable, err}); err != nil {
+				log.Println(err)
+			}
+			return
+		}
+		{{end}}
+		{{.ReceiverName}}.{{.Name}}(w, req)
+	{{end}}
+	}
+}
+`))
 )
 
 type FieldSetter struct {
@@ -370,7 +390,7 @@ func (v MaxValidator) Render(out io.Writer) error {
 }
 
 type WrapperMethod struct {
-	settings GenSettings
+	Settings GenSettings
 
 	fd *ast.FuncDecl
 
@@ -382,7 +402,7 @@ type WrapperMethod struct {
 }
 
 func NewWrapperMethod(fd *ast.FuncDecl, settings GenSettings) (*WrapperMethod, error) {
-	wm := &WrapperMethod{fd: fd, settings: settings}
+	wm := &WrapperMethod{fd: fd, Settings: settings}
 	if err := wm.parseReceiver(); err != nil {
 		return nil, err
 	}
@@ -554,7 +574,7 @@ func (wm *WrapperMethod) Name() string {
 }
 
 type ServeHTTPMethod struct {
-	wrappers []*WrapperMethod
+	Wrappers []*WrapperMethod
 	recName  string
 	recType  string
 }
@@ -563,7 +583,7 @@ func CreateFromAPIMethod(method *WrapperMethod) *ServeHTTPMethod {
 	wrappers := make([]*WrapperMethod, 0, 1)
 	wrappers = append(wrappers, method)
 	return &ServeHTTPMethod{
-		wrappers: wrappers,
+		Wrappers: wrappers,
 		recName:  method.recName,
 		recType:  method.recType,
 	}
@@ -577,16 +597,12 @@ func (sm *ServeHTTPMethod) RelateMethod(method *WrapperMethod) error {
 		return fmt.Errorf("failed to relate api method due with serve http method mismatch receiver type")
 	}
 
-	sm.wrappers = append(sm.wrappers, method)
+	sm.Wrappers = append(sm.Wrappers, method)
 	return nil
 }
 
 func (sm *ServeHTTPMethod) Render(out io.Writer) error {
-	_, _ = fmt.Fprintf(out, "func (%s *%s) ServeHTTP(w http.ResponseWriter, req *http.Request) {\n", sm.recName, sm.recType)
-	_, _ = fmt.Fprintln(out, "\t // handler body")
-	_, _ = fmt.Fprintln(out, "}")
-	_, _ = fmt.Fprintln(out)
-	return nil
+	return serveHTTPMethodTmpl.Execute(out, sm)
 }
 
 func (sm *ServeHTTPMethod) ReceiverName() string {

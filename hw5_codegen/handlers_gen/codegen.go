@@ -154,97 +154,184 @@ var (
 	{{.FieldName|lower}}Str := req.FormValue("{{.ParamName}}")
 	params.{{.FieldName}} = {{.FieldName|lower}}Str
 `))
-
 	fieldSetterIntTmpl = template.Must(template.New("fieldSetterIntTmpl").Funcs(funcMap).Parse(`
 	{{.FieldName|lower}}Str := req.FormValue("{{.ParamName}}")
 	{{.FieldName|lower}}Int, err := strconv.Atoi({{.FieldName|lower}}Str)
 	if err != nil {
+		// handle error
+		return
     }
 	params.{{.FieldName}} = {{.FieldName|lower}}Int
 `))
 
-	defaultFieldSetterStrTmpl = template.Must(template.New("defaultFieldSetterStrTmpl").Funcs(funcMap).Parse(`
+	defaultFieldSetterStrTmpl = template.Must(template.New("defaultFieldSetterStrTmpl").Parse(`
 	if params.{{.FieldName}} == "" {
 		params.{{.FieldName}} = "{{.DefaultVal}}"
 	}
 `))
-
-	defaultFieldSetterIntTmpl = template.Must(template.New("defaultFieldSetterIntTmpl").Funcs(funcMap).Parse(`
+	defaultFieldSetterIntTmpl = template.Must(template.New("defaultFieldSetterIntTmpl").Parse(`
 	if params.{{.FieldName}} == 0 {
 		params.{{.FieldName}} = {{.DefaultVal}}
 	}
 `))
+
+	requiredStrValidatorTmpl = template.Must(template.New("requiredStrValidatorTmpl").Parse(`
+	if params.{{.FieldName}} == "" {
+		// handle error
+		return
+	}
+`))
+	requiredIntValidatorTmpl = template.Must(template.New("requiredIntValidatorTmpl").Parse(`
+	if params.{{.FieldName}} == 0 {
+		// handle error
+		return
+	}
+`))
+
+	enumStrValidatorTmpl = template.Must(template.New("enumStrValidatorTmpl").Parse(`
+	switch params.{{.FieldName}} {
+	case {{range $i, $el := .Enum}}{{if (ne $i 0)}}, {{end}}"{{$el}}"{{end}}:
+	default:
+		// handle error
+		return
+	}
+`))
+	enumIntValidatorTmpl = template.Must(template.New("enumIntValidatorTmpl").Parse(`
+	switch params.{{.FieldName}} {
+	case {{range $i, $el := .Enum}}{{if (ne $i 0)}}, {{end}}{{$el}}{{end}}:
+	default:
+		// handle error
+		return
+	}
+`))
+
+	minStrValidatorTmpl = template.Must(template.New("minStrValidatorTmpl").Parse(`
+	if len(params.{{.FieldName}}) < {{.MinValue}} {
+		// handle error
+		return
+	}
+`))
+	minIntValidatorTmpl = template.Must(template.New("minIntValidatorTmpl").Parse(`
+	if params.{{.FieldName}} < {{.MinValue}} {
+		// handle error
+		return
+	}
+`))
+
+	maxStrValidatorTmpl = template.Must(template.New("maxStrValidatorTmpl").Parse(`
+	if len(params.{{.FieldName}}) > {{.MaxValue}} {
+		// handle error
+		return
+	}
+`))
+	maxIntValidatorTmpl = template.Must(template.New("maxIntValidatorTmpl").Parse(`
+	if params.{{.FieldName}} > {{.MaxValue}} {
+		// handle error
+		return
+	}
+`))
 )
 
-type FieldSetterStr struct {
+type FieldSetter struct {
+	dataType  string
 	FieldName string
 	ParamName string
 }
 
-func (f FieldSetterStr) Render(out io.Writer) error {
-	return fieldSetterStrTmpl.Execute(out, f)
+func (f FieldSetter) Render(out io.Writer) error {
+	switch f.dataType {
+	case "int":
+		return fieldSetterIntTmpl.Execute(out, f)
+	case "string":
+		return fieldSetterStrTmpl.Execute(out, f)
+	default:
+		return fmt.Errorf("unknown type %s", f.dataType)
+	}
 }
 
-type FieldSetterInt struct {
-	FieldSetterStr
-}
-
-func (f FieldSetterInt) Render(out io.Writer) error {
-	return fieldSetterIntTmpl.Execute(out, f)
-}
-
-type DefaultFieldSetterStr struct {
+type DefaultFieldSetter struct {
+	dataType   string
 	FieldName  string
 	DefaultVal string
 }
 
-func (f DefaultFieldSetterStr) Render(out io.Writer) error {
-	return defaultFieldSetterStrTmpl.Execute(out, f)
-}
-
-type DefaultFieldSetterInt struct {
-	DefaultFieldSetterStr
-}
-
-func (f DefaultFieldSetterInt) Render(out io.Writer) error {
-	return defaultFieldSetterIntTmpl.Execute(out, f)
-}
-
-type RendererFactory struct{}
-
-func (f RendererFactory) GetFieldSetter(dataType, fieldName, paramName string) (Renderer, error) {
-	fs := FieldSetterStr{
-		FieldName: fieldName,
-		ParamName: paramName,
-	}
-
-	switch dataType {
-	case "string":
-		return fs, nil
+func (f DefaultFieldSetter) Render(out io.Writer) error {
+	switch f.dataType {
 	case "int":
-		return FieldSetterInt{FieldSetterStr: fs}, nil
-	default:
-		return nil, fmt.Errorf("unknown type %s", dataType)
-	}
-}
-
-func (f RendererFactory) GetDefaultFieldSetter(dataType, fieldName, defaultVal string) (Renderer, error) {
-	fs := DefaultFieldSetterStr{
-		FieldName:  fieldName,
-		DefaultVal: defaultVal,
-	}
-
-	switch dataType {
+		return defaultFieldSetterIntTmpl.Execute(out, f)
 	case "string":
-		return fs, nil
-	case "int":
-		return DefaultFieldSetterInt{DefaultFieldSetterStr: fs}, nil
+		return defaultFieldSetterStrTmpl.Execute(out, f)
 	default:
-		return nil, fmt.Errorf("unknown type %s", dataType)
+		return fmt.Errorf("unknown type %s", f.dataType)
 	}
 }
 
-var rendererFactory = RendererFactory{}
+type RequiredValidator struct {
+	dataType  string
+	FieldName string
+}
+
+func (v RequiredValidator) Render(out io.Writer) error {
+	switch v.dataType {
+	case "int":
+		return requiredIntValidatorTmpl.Execute(out, v)
+	case "string":
+		return requiredStrValidatorTmpl.Execute(out, v)
+	default:
+		return fmt.Errorf("unknown type %s", v.dataType)
+	}
+}
+
+type EnumValidator struct {
+	dataType  string
+	FieldName string
+	Enum      []string
+}
+
+func (v EnumValidator) Render(out io.Writer) error {
+	switch v.dataType {
+	case "int":
+		return enumIntValidatorTmpl.Execute(out, v)
+	case "string":
+		return enumStrValidatorTmpl.Execute(out, v)
+	default:
+		return fmt.Errorf("unknown type %s", v.dataType)
+	}
+}
+
+type MinValidator struct {
+	dataType  string
+	FieldName string
+	MinValue  int
+}
+
+func (v MinValidator) Render(out io.Writer) error {
+	switch v.dataType {
+	case "int":
+		return minIntValidatorTmpl.Execute(out, v)
+	case "string":
+		return minStrValidatorTmpl.Execute(out, v)
+	default:
+		return fmt.Errorf("unknown type %s", v.dataType)
+	}
+}
+
+type MaxValidator struct {
+	dataType  string
+	FieldName string
+	MaxValue  int
+}
+
+func (v MaxValidator) Render(out io.Writer) error {
+	switch v.dataType {
+	case "int":
+		return maxIntValidatorTmpl.Execute(out, v)
+	case "string":
+		return maxStrValidatorTmpl.Execute(out, v)
+	default:
+		return fmt.Errorf("unknown type %s", v.dataType)
+	}
+}
 
 type WrapperMethod struct {
 	settings GenSettings
@@ -364,18 +451,21 @@ func (wm *WrapperMethod) Render(out io.Writer) error {
 				paramName = strings.ToLower(fieldName.Name)
 			}
 
-			el, err := rendererFactory.GetFieldSetter(fieldType.Name, fieldName.Name, paramName)
-			if err != nil {
-				return fmt.Errorf("failed to get field setter due %v", err)
-			}
-			chain = append(chain, el)
-
+			chain = append(chain, FieldSetter{fieldType.Name, fieldName.Name, paramName})
 			if defaultVal := tagParser.Default(); defaultVal != "" {
-				el, err := rendererFactory.GetDefaultFieldSetter(fieldType.Name, fieldName.Name, defaultVal)
-				if err != nil {
-					return fmt.Errorf("failed to get default field setter due %v", err)
-				}
-				chain = append(chain, el)
+				chain = append(chain, DefaultFieldSetter{fieldType.Name, fieldName.Name, defaultVal})
+			}
+			if tagParser.IsRequired() {
+				chain = append(chain, RequiredValidator{fieldType.Name, fieldName.Name})
+			}
+			if enum := tagParser.Enum(); len(enum) != 0 {
+				chain = append(chain, EnumValidator{fieldType.Name, fieldName.Name, tagParser.Enum()})
+			}
+			if minVal := tagParser.Min(); minVal != 0 {
+				chain = append(chain, MinValidator{fieldType.Name, fieldName.Name, minVal})
+			}
+			if maxVal := tagParser.Max(); maxVal != 0 {
+				chain = append(chain, MaxValidator{fieldType.Name, fieldName.Name, maxVal})
 			}
 		}
 

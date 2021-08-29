@@ -145,6 +145,12 @@ type Renderer interface {
 	Render(out io.Writer) error
 }
 
+type RendererFunc func(out io.Writer) error
+
+func (f RendererFunc) Renderer(out io.Writer) error {
+	return f(out)
+}
+
 var funcMap = template.FuncMap{
 	"lower": strings.ToLower,
 	"sliceToStr": func(sl []string) string {
@@ -153,36 +159,6 @@ var funcMap = template.FuncMap{
 }
 
 var (
-	respondErrorFuncTmpl = template.Must(template.New("respondErrorFuncTmpl").Parse(`
-func respondError(w http.ResponseWriter, err error) error {
-	if apiErr, ok := err.(ApiError); ok {
-		view := struct {
-			Error string ` + "`json:\"error\"`" + `
-		}{apiErr.Err.Error()}
-
-		payload, err := json.Marshal(view)
-		if err != nil {
-			return fmt.Errorf("failed to marshal error due %v", err)
-		}
-
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(apiErr.HTTPStatus)
-		_, err = w.Write(payload)
-		if err != nil {
-			return fmt.Errorf("failed to write response body due %v", err)
-		}
-
-		return nil
-	}
-
-	return respondError(w, ApiError{
-		HTTPStatus: http.StatusInternalServerError,
-		Err:        err,
-	})
-}
-
-`))
-
 	fieldSetterStrTmpl = template.Must(template.New("fieldSetterStrTmpl").Funcs(funcMap).Parse(`
 	{{.FieldName|lower}}Str := req.FormValue("{{.ParamName}}")
 	params.{{.FieldName}} = {{.FieldName|lower}}Str
@@ -536,6 +512,30 @@ func (wm *WrapperMethod) Render(out io.Writer) error {
 		}
 	}
 
+	_, _ = fmt.Fprintf(out, "\n\tres, err := %s.%s(req.Context(), params)\n", wm.recName, wm.fd.Name.Name)
+	_, _ = fmt.Fprintln(out, `	if err != nil {
+		if err = respondError(w, err); err != nil {
+			log.Println(err)
+			return
+		}
+	}
+	
+	body := ResponseBody{Response: res}
+	payload, err := json.Marshal(body)
+	if err != nil {
+		if err = respondError(w, err); err != nil {
+			log.Println(err)
+			return
+		}
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_, err = w.Write(payload)
+	if err != nil {
+		log.Println(err)
+	}`)
+
 	_, _ = fmt.Fprintln(out, "}")
 	_, _ = fmt.Fprintln(out)
 	return nil
@@ -597,10 +597,47 @@ func (sm *ServeHTTPMethod) ReceiverType() string {
 	return sm.recType
 }
 
-type RespondErrorFunc struct{}
+func RenderResponseBodyStruct(out io.Writer) error {
+	_, err := out.Write([]byte(`type ResponseBody struct {
+	Error    string ` + "     `json:\"error\"`" + `
+	Response interface{} ` + "`json:\"response,omitempty\"`" + `
+}
 
-func (f RespondErrorFunc) Render(out io.Writer) error {
-	return respondErrorFuncTmpl.Execute(out, f)
+`))
+	return err
+}
+
+func RenderRespondErrorFunc(out io.Writer) error {
+	_, err := out.Write([]byte(`
+func respondError(w http.ResponseWriter, err error) error {
+	if apiErr, ok := err.(ApiError); ok {
+		view := struct {
+			Error string ` + "`json:\"error\"`" + `
+		}{apiErr.Err.Error()}
+
+		payload, err := json.Marshal(view)
+		if err != nil {
+			return fmt.Errorf("failed to marshal error due %v", err)
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(apiErr.HTTPStatus)
+		_, err = w.Write(payload)
+		if err != nil {
+			return fmt.Errorf("failed to write response body due %v", err)
+		}
+
+		return nil
+	}
+
+	return respondError(w, ApiError{
+		HTTPStatus: http.StatusInternalServerError,
+		Err:        err,
+	})
+}
+
+`))
+	return err
 }
 
 func exitWithMessage(msg string) {
@@ -640,6 +677,8 @@ import (
 	"strconv"
 )`)
 	_, _ = fmt.Fprintln(out)
+
+	RendererFunc(RenderResponseBodyStruct).Renderer(out)
 
 	pattern := regexp.MustCompile(`^\/\/\s*apigen:api\s+({.+})$`)
 	serveMethods := make(map[string]*ServeHTTPMethod)
@@ -697,7 +736,7 @@ import (
 		wrapper.Render(out)
 	}
 
-	RespondErrorFunc{}.Render(out)
+	RendererFunc(RenderRespondErrorFunc).Renderer(out)
 
 	for _, serveMethod := range serveMethods {
 		serveMethod.Render(out)

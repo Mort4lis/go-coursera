@@ -238,12 +238,11 @@ func (b *UpdateQueryBuilder) Table(tableName string) *UpdateQueryBuilder {
 }
 
 func (b *UpdateQueryBuilder) Set(columnName string, arg interface{}) *UpdateQueryBuilder {
-	b.builder.WriteRune(' ')
 	if !b.wasSet {
-		b.builder.WriteString("SET")
+		b.builder.WriteString(" SET")
 		b.wasSet = true
 	} else {
-		b.builder.WriteString("AND")
+		b.builder.WriteRune(',')
 	}
 
 	b.builder.WriteString(fmt.Sprintf(" `%s` = ?", columnName))
@@ -313,8 +312,6 @@ type ApiError struct {
 }
 
 var (
-	errBadLimit         = ApiError{Status: http.StatusBadRequest, Err: errors.New("bad limit")}
-	errBadOffset        = ApiError{Status: http.StatusBadRequest, Err: errors.New("bad offset")}
 	errTableNotFound    = ApiError{Status: http.StatusNotFound, Err: errors.New("unknown table")}
 	errRecordNotFound   = ApiError{Status: http.StatusNotFound, Err: errors.New("record not found")}
 	errResourceNotFound = ApiError{Status: http.StatusNotFound, Err: errors.New("resource is not found")}
@@ -325,6 +322,11 @@ var (
 func (ae ApiError) Error() string {
 	return ae.Err.Error()
 }
+
+const (
+	defaultLimit  = 5
+	defaultOffset = 0
+)
 
 type ResponseBody struct {
 	Error    string      `json:"error,omitempty"`
@@ -426,21 +428,19 @@ func (t *TableHandler) handleRecordList(w http.ResponseWriter, req *http.Request
 	query := req.URL.Query()
 
 	var err error
-	limit := 5
+	limit := defaultLimit
 	if limitStr := query.Get("limit"); limitStr != "" {
 		limit, err = strconv.Atoi(limitStr)
 		if err != nil {
-			t.respondError(w, errBadLimit)
-			return
+			limit = defaultLimit
 		}
 	}
 
-	offset := 0
+	offset := defaultOffset
 	if offsetStr := query.Get("offset"); offsetStr != "" {
 		offset, err = strconv.Atoi(offsetStr)
 		if err != nil {
-			t.respondError(w, errBadOffset)
-			return
+			offset = defaultOffset
 		}
 	}
 
@@ -481,16 +481,19 @@ func (t *TableHandler) handleRecordCreate(w http.ResponseWriter, req *http.Reque
 		}
 
 		val := record[column.Name]
-		if column.IsNullable && val == nil {
-			continue
-		}
-		if !column.IsNullable && val == nil {
-			err := ApiError{
-				Status: http.StatusBadRequest,
-				Err:    fmt.Errorf("%s must be required", column.Name),
+		if val == nil {
+			if column.IsNullable {
+				continue
 			}
-			t.respondError(w, err)
-			return
+
+			switch column.Type {
+			case IntType:
+				val = 0
+			case FloatType:
+				val = 0.0
+			case VarcharType, TextType:
+				val = ""
+			}
 		}
 
 		val, err := t.validateColumnValue(column, val)
@@ -517,7 +520,7 @@ func (t *TableHandler) handleRecordCreate(w http.ResponseWriter, req *http.Reque
 	}
 
 	body := map[string]int64{table.Primary().Name: lastInsertID}
-	t.successRespond(w, http.StatusCreated, body)
+	t.successRespond(w, http.StatusOK, body)
 }
 
 func (t *TableHandler) handleRecordDetail(w http.ResponseWriter, req *http.Request, table *Table, recordID int) {
@@ -558,10 +561,11 @@ func (t *TableHandler) handleRecordUpdate(w http.ResponseWriter, req *http.Reque
 	builder := &UpdateQueryBuilder{}
 	builder.Table(table.Name)
 	for _, column := range table.Columns {
-		val := record[column.Name]
-		if val == nil {
+		val, exist := record[column.Name]
+		if !exist {
 			continue
 		}
+
 		if column.IsPrimary && val != nil {
 			err := ApiError{
 				Status: http.StatusBadRequest,
@@ -581,7 +585,6 @@ func (t *TableHandler) handleRecordUpdate(w http.ResponseWriter, req *http.Reque
 	}
 	builder.Where("AND", table.Primary().Name, recordID)
 
-	fmt.Println(builder.String())
 	result, err := t.db.ExecContext(req.Context(), builder.String(), builder.Args()...)
 	if err != nil {
 		log.Println(err)
@@ -685,6 +688,10 @@ func (t *TableHandler) createRecordsFromRows(rows *sql.Rows) ([]Record, error) {
 }
 
 func (t *TableHandler) validateColumnValue(column *Column, val interface{}) (interface{}, error) {
+	if column.IsNullable && val == nil {
+		return val, nil
+	}
+
 	switch column.Type {
 	case IntType, FloatType:
 		floatVal, ok := val.(float64)

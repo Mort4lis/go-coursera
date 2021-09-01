@@ -20,11 +20,23 @@ type Table struct {
 	Columns []*Column
 }
 
-type Column struct {
-	Name     string
-	Type     string
-	Nullable bool
+func (t *Table) Primary() *Column {
+	for _, column := range t.Columns {
+		if column.IsPrimary {
+			return column
+		}
+	}
+	return nil
 }
+
+type Column struct {
+	Name      string
+	Type      string
+	Nullable  bool
+	IsPrimary bool
+}
+
+type Record map[string]interface{}
 
 func getTables(db *sql.DB) ([]*Table, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -75,15 +87,21 @@ func getColumns(db *sql.DB, tableName string) ([]*Column, error) {
 
 	columns := make([]*Column, 0)
 	for rows.Next() {
-		var null string
+		var (
+			null string
+			key  sql.NullString
+		)
 		column := new(Column)
-		vals[0], vals[1], vals[2] = &column.Name, &column.Type, &null
+		vals[0], vals[1], vals[2], vals[3] = &column.Name, &column.Type, &null, &key
 		if err = rows.Scan(vals...); err != nil {
 			return nil, fmt.Errorf("error occurred during load columns due %v", err)
 		}
 
 		if null == "YES" {
 			column.Nullable = true
+		}
+		if key.Valid && key.String == "PRI" {
+			column.IsPrimary = true
 		}
 		columns = append(columns, column)
 	}
@@ -98,63 +116,56 @@ func getColumns(db *sql.DB, tableName string) ([]*Column, error) {
 	return columns, nil
 }
 
-type SimpleQueryBuilder struct {
+type SelectQueryBuilder struct {
 	builder strings.Builder
-	err     error
+	args    []interface{}
 
-	wasFrom  bool
 	wasWhere bool
 }
 
-func (b *SimpleQueryBuilder) From(table string) *SimpleQueryBuilder {
-	if b.err != nil {
-		return b
-	}
-	if b.wasFrom {
-		b.err = fmt.Errorf("failed to call From() twice or more")
-		return b
-	}
-
+func (b *SelectQueryBuilder) From(table string) *SelectQueryBuilder {
 	stmt := fmt.Sprintf("SELECT * FROM `%s`", table)
 	b.builder.WriteString(stmt)
-	b.wasFrom = true
 	return b
 }
 
-func (b *SimpleQueryBuilder) Limit(val int) *SimpleQueryBuilder {
-	if b.err != nil {
-		return b
-	}
-	if !b.wasFrom {
-		b.err = fmt.Errorf("failed to call Limit() before From()")
-		return b
+func (b *SelectQueryBuilder) And(column string, val interface{}) *SelectQueryBuilder {
+	b.buildCondition("AND", column, val)
+	return b
+}
+
+func (b *SelectQueryBuilder) buildCondition(op, column string, arg interface{}) {
+	b.builder.WriteRune(' ')
+	if !b.wasWhere {
+		b.builder.WriteString("WHERE")
+		b.wasWhere = true
+	} else {
+		b.builder.WriteString(op)
 	}
 
+	b.builder.WriteString(fmt.Sprintf(" `%s` = ?", column))
+
+	b.args = append(b.args, arg)
+}
+
+func (b *SelectQueryBuilder) Limit(val int) *SelectQueryBuilder {
 	stmt := fmt.Sprintf(" LIMIT %d", val)
 	b.builder.WriteString(stmt)
 	return b
 }
 
-func (b *SimpleQueryBuilder) Offset(val int) *SimpleQueryBuilder {
-	if b.err != nil {
-		return b
-	}
-	if !b.wasFrom {
-		b.err = fmt.Errorf("failed to call Offset() before From()")
-		return b
-	}
-
+func (b *SelectQueryBuilder) Offset(val int) *SelectQueryBuilder {
 	stmt := fmt.Sprintf(" OFFSET %d", val)
 	b.builder.WriteString(stmt)
 	return b
 }
 
-func (b *SimpleQueryBuilder) Err() error {
-	return b.err
+func (b *SelectQueryBuilder) String() string {
+	return b.builder.String()
 }
 
-func (b *SimpleQueryBuilder) String() string {
-	return b.builder.String()
+func (b *SelectQueryBuilder) Args() []interface{} {
+	return b.args
 }
 
 type ApiError struct {
@@ -166,6 +177,7 @@ var (
 	errBadLimit         = ApiError{Status: http.StatusBadRequest, Err: errors.New("bad limit")}
 	errBadOffset        = ApiError{Status: http.StatusBadRequest, Err: errors.New("bad offset")}
 	errTableNotFound    = ApiError{Status: http.StatusNotFound, Err: errors.New("unknown table")}
+	errRecordNotFound   = ApiError{Status: http.StatusNotFound, Err: errors.New("record not found")}
 	errResourceNotFound = ApiError{Status: http.StatusNotFound, Err: errors.New("resource is not found")}
 	errNotAllowed       = ApiError{Status: http.StatusMethodNotAllowed, Err: errors.New("method is not allowed")}
 	errInternal         = ApiError{Status: http.StatusInternalServerError, Err: errors.New("internal server error")}
@@ -184,8 +196,12 @@ type ResponseTablesBody struct {
 	Tables []string `json:"tables"`
 }
 
+type ResponseRecordBody struct {
+	Record Record `json:"record"`
+}
+
 type ResponseRecordsBody struct {
-	Records []map[string]interface{} `json:"records"`
+	Records []Record `json:"records"`
 }
 
 type TableHandler struct {
@@ -207,7 +223,7 @@ func (t *TableHandler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	case t.listRegex.MatchString(url):
 		groups := t.listRegex.FindStringSubmatch(url)
 		if len(groups) != 2 {
-			log.Printf("submatch group len must be equal 2")
+			log.Println("submatch group len must be equal 2")
 			t.respondError(w, errInternal)
 			return
 		}
@@ -223,13 +239,33 @@ func (t *TableHandler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		case http.MethodGet:
 			t.handleRecordList(w, req, table)
 		case http.MethodPut:
-
 		default:
 			t.respondError(w, errNotAllowed)
 		}
 	case t.detailRegex.MatchString(url):
 		groups := t.detailRegex.FindStringSubmatch(url)
-		fmt.Fprintln(w, "detail", "id = ", groups[1])
+		if len(groups) != 3 {
+			log.Println("submatch group len must be equal 3")
+			t.respondError(w, errInternal)
+			return
+		}
+
+		tableName := groups[1]
+		table, exist := t.tablesMap[tableName]
+		if !exist {
+			t.respondError(w, errTableNotFound)
+			return
+		}
+		recordID, _ := strconv.Atoi(groups[2])
+
+		switch req.Method {
+		case http.MethodGet:
+			t.handleRecordDetail(w, req, table, recordID)
+		case http.MethodPost:
+		case http.MethodDelete:
+		default:
+			t.respondError(w, errNotAllowed)
+		}
 	default:
 		t.respondError(w, errResourceNotFound)
 	}
@@ -266,13 +302,8 @@ func (t *TableHandler) handleRecordList(w http.ResponseWriter, req *http.Request
 		}
 	}
 
-	builder := &SimpleQueryBuilder{}
+	builder := &SelectQueryBuilder{}
 	builder.From(table.Name).Limit(limit).Offset(offset)
-	if err = builder.Err(); err != nil {
-		log.Println(err)
-		t.respondError(w, errInternal)
-		return
-	}
 
 	rows, err := t.db.QueryContext(req.Context(), builder.String())
 	if err != nil {
@@ -281,14 +312,56 @@ func (t *TableHandler) handleRecordList(w http.ResponseWriter, req *http.Request
 		return
 	}
 
-	columnsTypes, err := rows.ColumnTypes()
+	records, err := t.createRecordsFromRows(rows)
 	if err != nil {
 		log.Println(err)
 		t.respondError(w, errInternal)
 		return
 	}
 
-	records := make([]map[string]interface{}, 0)
+	t.successRespond(w, http.StatusOK, ResponseRecordsBody{records})
+}
+
+func (t *TableHandler) handleRecordDetail(w http.ResponseWriter, req *http.Request, table *Table, recordID int) {
+	primary := table.Primary()
+	if primary == nil {
+		log.Printf("table %s doesn't have the primary key", table.Name)
+		t.respondError(w, errInternal)
+		return
+	}
+
+	builder := &SelectQueryBuilder{}
+	builder.From(table.Name).And(primary.Name, recordID).Limit(1)
+
+	rows, err := t.db.QueryContext(req.Context(), builder.String(), builder.Args()...)
+	if err != nil {
+		log.Println(err)
+		t.respondError(w, errInternal)
+		return
+	}
+
+	records, err := t.createRecordsFromRows(rows)
+	if err != nil {
+		log.Println(err)
+		t.respondError(w, errInternal)
+		return
+	}
+
+	if len(records) == 0 {
+		t.respondError(w, errRecordNotFound)
+		return
+	}
+
+	t.successRespond(w, http.StatusOK, ResponseRecordBody{records[0]})
+}
+
+func (t *TableHandler) createRecordsFromRows(rows *sql.Rows) ([]Record, error) {
+	columnsTypes, err := rows.ColumnTypes()
+	if err != nil {
+		return nil, err
+	}
+
+	records := make([]Record, 0)
 	for rows.Next() {
 		vals := make([]interface{}, len(columnsTypes))
 		for i, columnType := range columnsTypes {
@@ -314,20 +387,16 @@ func (t *TableHandler) handleRecordList(w http.ResponseWriter, req *http.Request
 			}
 		}
 
-		record := make(map[string]interface{}, len(columnsTypes))
+		record := make(Record, len(columnsTypes))
 		if err = rows.Scan(vals...); err != nil {
-			log.Println(err)
-			t.respondError(w, errInternal)
-			return
+			return nil, err
 		}
 
 		for i, columnType := range columnsTypes {
 			if valuer, ok := vals[i].(driver.Valuer); ok {
 				val, err := valuer.Value()
 				if err != nil {
-					log.Println(err)
-					t.respondError(w, errInternal)
-					return
+					return nil, err
 				}
 
 				record[columnType.Name()] = val
@@ -338,7 +407,7 @@ func (t *TableHandler) handleRecordList(w http.ResponseWriter, req *http.Request
 		records = append(records, record)
 	}
 
-	t.successRespond(w, http.StatusOK, ResponseRecordsBody{records})
+	return records, nil
 }
 
 func (t *TableHandler) successRespond(w http.ResponseWriter, statusCode int, response interface{}) {

@@ -207,19 +207,15 @@ func (t *TableHandler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	case t.listRegex.MatchString(url):
 		groups := t.listRegex.FindStringSubmatch(url)
 		if len(groups) != 2 {
-			log.Println("")
-			if err := t.respondError(w, errInternal); err != nil {
-				log.Println(err)
-			}
+			log.Printf("submatch group len must be equal 2")
+			t.respondError(w, errInternal)
 			return
 		}
 
 		tableName := groups[1]
 		table, exist := t.tablesMap[tableName]
 		if !exist {
-			if err := t.respondError(w, errTableNotFound); err != nil {
-				log.Println(err)
-			}
+			t.respondError(w, errTableNotFound)
 			return
 		}
 
@@ -229,17 +225,13 @@ func (t *TableHandler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		case http.MethodPut:
 
 		default:
-			if err := t.respondError(w, errNotAllowed); err != nil {
-				log.Println(err)
-			}
+			t.respondError(w, errNotAllowed)
 		}
 	case t.detailRegex.MatchString(url):
 		groups := t.detailRegex.FindStringSubmatch(url)
 		fmt.Fprintln(w, "detail", "id = ", groups[1])
 	default:
-		if err := t.respondError(w, errResourceNotFound); err != nil {
-			log.Println(err)
-		}
+		t.respondError(w, errResourceNotFound)
 	}
 }
 
@@ -249,22 +241,7 @@ func (t *TableHandler) handleTableList(w http.ResponseWriter) {
 		tableNames = append(tableNames, table.Name)
 	}
 
-	respBody := ResponseBody{Response: ResponseTablesBody{tableNames}}
-	payload, err := json.Marshal(respBody)
-	if err != nil {
-		if err = t.respondError(w, err); err != nil {
-			log.Println(err)
-		}
-
-		return
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
-	_, err = w.Write(payload)
-	if err != nil {
-		log.Printf("error occurred during write to response writer due %v", err)
-	}
+	t.successRespond(w, http.StatusOK, ResponseTablesBody{tableNames})
 }
 
 func (t *TableHandler) handleRecordList(w http.ResponseWriter, req *http.Request, table *Table) {
@@ -275,10 +252,7 @@ func (t *TableHandler) handleRecordList(w http.ResponseWriter, req *http.Request
 	if limitStr := query.Get("limit"); limitStr != "" {
 		limit, err = strconv.Atoi(limitStr)
 		if err != nil {
-			log.Println(err)
-			if err = t.respondError(w, errBadLimit); err != nil {
-				log.Println(err)
-			}
+			t.respondError(w, errBadLimit)
 			return
 		}
 	}
@@ -287,10 +261,8 @@ func (t *TableHandler) handleRecordList(w http.ResponseWriter, req *http.Request
 	if offsetStr := query.Get("offset"); offsetStr != "" {
 		offset, err = strconv.Atoi(offsetStr)
 		if err != nil {
-			log.Println(err)
-			if err = t.respondError(w, errBadOffset); err != nil {
-				log.Println(err)
-			}
+			t.respondError(w, errBadOffset)
+			return
 		}
 	}
 
@@ -298,23 +270,21 @@ func (t *TableHandler) handleRecordList(w http.ResponseWriter, req *http.Request
 	builder.From(table.Name).Limit(limit).Offset(offset)
 	if err = builder.Err(); err != nil {
 		log.Println(err)
-		if err = t.respondError(w, errInternal); err != nil {
-			log.Println(err)
-		}
+		t.respondError(w, errInternal)
 		return
 	}
 
 	rows, err := t.db.QueryContext(req.Context(), builder.String())
 	if err != nil {
 		log.Println(err)
-		_ = t.respondError(w, errInternal)
+		t.respondError(w, errInternal)
 		return
 	}
 
 	columnsTypes, err := rows.ColumnTypes()
 	if err != nil {
 		log.Println(err)
-		_ = t.respondError(w, errInternal)
+		t.respondError(w, errInternal)
 		return
 	}
 
@@ -347,7 +317,7 @@ func (t *TableHandler) handleRecordList(w http.ResponseWriter, req *http.Request
 		record := make(map[string]interface{}, len(columnsTypes))
 		if err = rows.Scan(vals...); err != nil {
 			log.Println(err)
-			_ = t.respondError(w, errInternal)
+			t.respondError(w, errInternal)
 			return
 		}
 
@@ -356,7 +326,7 @@ func (t *TableHandler) handleRecordList(w http.ResponseWriter, req *http.Request
 				val, err := valuer.Value()
 				if err != nil {
 					log.Println(err)
-					_ = t.respondError(w, errInternal)
+					t.respondError(w, errInternal)
 					return
 				}
 
@@ -368,42 +338,47 @@ func (t *TableHandler) handleRecordList(w http.ResponseWriter, req *http.Request
 		records = append(records, record)
 	}
 
-	respBody := ResponseBody{Response: ResponseRecordsBody{records}}
+	t.successRespond(w, http.StatusOK, ResponseRecordsBody{records})
+}
+
+func (t *TableHandler) successRespond(w http.ResponseWriter, statusCode int, response interface{}) {
+	respBody := ResponseBody{Response: response}
 	payload, err := json.Marshal(respBody)
 	if err != nil {
-		log.Println(err)
-		_ = t.respondError(w, errInternal)
+		log.Printf("failed to marshal response body due %v", err)
+		t.respondError(w, errInternal)
 		return
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
+	w.WriteHeader(statusCode)
 	_, err = w.Write(payload)
 	if err != nil {
 		log.Printf("error occurred during write to response writer due %v", err)
 	}
 }
 
-func (t *TableHandler) respondError(w http.ResponseWriter, err error) error {
+func (t *TableHandler) respondError(w http.ResponseWriter, err error) {
 	if apiErr, ok := err.(ApiError); ok {
 		view := ResponseBody{Error: apiErr.Err.Error()}
 
 		payload, err := json.Marshal(view)
 		if err != nil {
-			return fmt.Errorf("failed to marshal error due %v", err)
+			log.Printf("failed to marshal payload due %v", err)
+			return
 		}
 
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(apiErr.Status)
 		_, err = w.Write(payload)
 		if err != nil {
-			return fmt.Errorf("failed to write response body due %v", err)
+			log.Printf("failed to write response body due %v", err)
 		}
 
-		return nil
+		return
 	}
 
-	return t.respondError(w, ApiError{
+	t.respondError(w, ApiError{
 		Status: http.StatusInternalServerError,
 		Err:    err,
 	})

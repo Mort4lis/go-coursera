@@ -15,6 +15,13 @@ import (
 	"time"
 )
 
+const (
+	IntType     = "INT"
+	FloatType   = "FLOAT"
+	TextType    = "TEXT"
+	VarcharType = "VARCHAR"
+)
+
 type Table struct {
 	Name    string
 	Columns []*Column
@@ -30,10 +37,11 @@ func (t *Table) Primary() *Column {
 }
 
 type Column struct {
-	Name      string
-	Type      string
-	Nullable  bool
-	IsPrimary bool
+	Name            string
+	Type            string
+	IsNullable      bool
+	IsPrimary       bool
+	IsAutoIncrement bool
 }
 
 type Record map[string]interface{}
@@ -75,34 +83,39 @@ func getColumns(db *sql.DB, tableName string) ([]*Column, error) {
 		return nil, fmt.Errorf("error occurred during get rows due %v", err)
 	}
 
-	rowCols, err := rows.Columns()
-	if err != nil {
-		return nil, fmt.Errorf("error occurred during get column names due %v", err)
-	}
-
-	vals := make([]interface{}, len(rowCols))
-	for i := range vals {
-		vals[i] = new(sql.RawBytes)
-	}
-
 	columns := make([]*Column, 0)
 	for rows.Next() {
 		var (
-			null string
-			key  sql.NullString
+			null  string
+			key   sql.NullString
+			extra sql.NullString
 		)
+
 		column := new(Column)
-		vals[0], vals[1], vals[2], vals[3] = &column.Name, &column.Type, &null, &key
+		vals := []interface{}{&column.Name, &column.Type, &null, &key, new(sql.RawBytes), &extra}
 		if err = rows.Scan(vals...); err != nil {
 			return nil, fmt.Errorf("error occurred during load columns due %v", err)
 		}
 
+		if typeParts := strings.SplitN(column.Type, "(", 2); len(typeParts) != 0 {
+			column.Type = strings.ToUpper(typeParts[0])
+		}
+		switch column.Type {
+		case IntType, FloatType, VarcharType, TextType:
+		default:
+			return nil, fmt.Errorf("unknown column data type %s", column.Type)
+		}
+
 		if null == "YES" {
-			column.Nullable = true
+			column.IsNullable = true
 		}
 		if key.Valid && key.String == "PRI" {
 			column.IsPrimary = true
 		}
+		if extra.Valid && extra.String == "auto_increment" {
+			column.IsAutoIncrement = true
+		}
+
 		columns = append(columns, column)
 	}
 
@@ -368,20 +381,20 @@ func (t *TableHandler) createRecordsFromRows(rows *sql.Rows) ([]Record, error) {
 			dbType := columnType.DatabaseTypeName()
 			if nullable, _ := columnType.Nullable(); nullable {
 				switch dbType {
-				case "INT":
+				case IntType:
 					vals[i] = new(sql.NullInt64)
-				case "FLOAT":
+				case FloatType:
 					vals[i] = new(sql.NullFloat64)
-				case "VARCHAR", "TEXT":
+				case VarcharType, TextType:
 					vals[i] = new(sql.NullString)
 				}
 			} else {
 				switch dbType {
-				case "INT":
+				case IntType:
 					vals[i] = new(int64)
-				case "FLOAT":
+				case FloatType:
 					vals[i] = new(float64)
-				case "VARCHAR", "TEXT":
+				case VarcharType, TextType:
 					vals[i] = new(string)
 				}
 			}

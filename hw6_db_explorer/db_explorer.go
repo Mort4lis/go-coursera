@@ -149,12 +149,7 @@ func (b *SelectQueryBuilder) From(table string) *SelectQueryBuilder {
 	return b
 }
 
-func (b *SelectQueryBuilder) And(column string, val interface{}) *SelectQueryBuilder {
-	b.buildCondition("AND", column, val)
-	return b
-}
-
-func (b *SelectQueryBuilder) buildCondition(op, column string, arg interface{}) {
+func (b *SelectQueryBuilder) Where(op, column string, arg interface{}) *SelectQueryBuilder {
 	b.builder.WriteRune(' ')
 	if !b.wasWhere {
 		b.builder.WriteString("WHERE")
@@ -164,8 +159,8 @@ func (b *SelectQueryBuilder) buildCondition(op, column string, arg interface{}) 
 	}
 
 	b.builder.WriteString(fmt.Sprintf(" `%s` = ?", column))
-
 	b.args = append(b.args, arg)
+	return b
 }
 
 func (b *SelectQueryBuilder) Limit(val int) *SelectQueryBuilder {
@@ -200,7 +195,7 @@ func (b *InsertQueryBuilder) Into(tableName string) *InsertQueryBuilder {
 	return b
 }
 
-func (b *InsertQueryBuilder) Add(columnName string, arg interface{}) *InsertQueryBuilder {
+func (b *InsertQueryBuilder) Insert(columnName string, arg interface{}) *InsertQueryBuilder {
 	if len(b.args) != 0 {
 		b.builder.WriteString(", ")
 	}
@@ -226,6 +221,55 @@ func (b *InsertQueryBuilder) String() string {
 }
 
 func (b *InsertQueryBuilder) Args() []interface{} {
+	return b.args
+}
+
+type UpdateQueryBuilder struct {
+	builder strings.Builder
+	args    []interface{}
+
+	wasSet   bool
+	wasWhere bool
+}
+
+func (b *UpdateQueryBuilder) Table(tableName string) *UpdateQueryBuilder {
+	b.builder.WriteString(fmt.Sprintf("UPDATE `%s`", tableName))
+	return b
+}
+
+func (b *UpdateQueryBuilder) Set(columnName string, arg interface{}) *UpdateQueryBuilder {
+	b.builder.WriteRune(' ')
+	if !b.wasSet {
+		b.builder.WriteString("SET")
+		b.wasSet = true
+	} else {
+		b.builder.WriteString("AND")
+	}
+
+	b.builder.WriteString(fmt.Sprintf(" `%s` = ?", columnName))
+	b.args = append(b.args, arg)
+	return b
+}
+
+func (b *UpdateQueryBuilder) Where(op, columnName string, arg interface{}) *UpdateQueryBuilder {
+	b.builder.WriteRune(' ')
+	if !b.wasWhere {
+		b.builder.WriteString("WHERE")
+		b.wasWhere = true
+	} else {
+		b.builder.WriteString(op)
+	}
+
+	b.builder.WriteString(fmt.Sprintf(" `%s` = ?", columnName))
+	b.args = append(b.args, arg)
+	return b
+}
+
+func (b *UpdateQueryBuilder) String() string {
+	return b.builder.String()
+}
+
+func (b *UpdateQueryBuilder) Args() []interface{} {
 	return b.args
 }
 
@@ -324,6 +368,7 @@ func (t *TableHandler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		case http.MethodGet:
 			t.handleRecordDetail(w, req, table, recordID)
 		case http.MethodPost:
+			t.handleRecordUpdate(w, req, table, recordID)
 		case http.MethodDelete:
 		default:
 			t.respondError(w, errNotAllowed)
@@ -413,35 +458,13 @@ func (t *TableHandler) handleRecordCreate(w http.ResponseWriter, req *http.Reque
 			return
 		}
 
-		switch column.Type {
-		case IntType, FloatType:
-			floatVal, ok := val.(float64)
-			if !ok {
-				err := ApiError{
-					Status: http.StatusBadRequest,
-					Err:    fmt.Errorf("field %s have invalid type", column.Name),
-				}
-				t.respondError(w, err)
-				return
-			}
-
-			if column.Type == IntType {
-				builder.Add(column.Name, int(floatVal))
-			} else {
-				builder.Add(column.Name, floatVal)
-			}
-		case VarcharType, TextType:
-			strVal, ok := val.(string)
-			if !ok {
-				err := ApiError{
-					Status: http.StatusBadRequest,
-					Err:    fmt.Errorf("field %s have invalid type", column.Name),
-				}
-				t.respondError(w, err)
-				return
-			}
-			builder.Add(column.Name, strVal)
+		val, err := t.validateColumnValue(column, val)
+		if err != nil {
+			t.respondError(w, ApiError{Status: http.StatusBadRequest, Err: err})
+			return
 		}
+
+		builder.Insert(column.Name, val)
 	}
 
 	result, err := t.db.ExecContext(req.Context(), builder.String(), builder.Args()...)
@@ -464,7 +487,7 @@ func (t *TableHandler) handleRecordCreate(w http.ResponseWriter, req *http.Reque
 
 func (t *TableHandler) handleRecordDetail(w http.ResponseWriter, req *http.Request, table *Table, recordID int) {
 	builder := &SelectQueryBuilder{}
-	builder.From(table.Name).And(table.Primary().Name, recordID).Limit(1)
+	builder.From(table.Name).Where("", table.Primary().Name, recordID).Limit(1)
 
 	rows, err := t.db.QueryContext(req.Context(), builder.String(), builder.Args()...)
 	if err != nil {
@@ -486,6 +509,60 @@ func (t *TableHandler) handleRecordDetail(w http.ResponseWriter, req *http.Reque
 	}
 
 	t.successRespond(w, http.StatusOK, ResponseRecordBody{records[0]})
+}
+
+func (t *TableHandler) handleRecordUpdate(w http.ResponseWriter, req *http.Request, table *Table, recordID int) {
+	var record Record
+	if err := json.NewDecoder(req.Body).Decode(&record); err != nil {
+		log.Println(err)
+		t.respondError(w, errInternal)
+		return
+	}
+	defer func() { _ = req.Body.Close() }()
+
+	builder := &UpdateQueryBuilder{}
+	builder.Table(table.Name)
+	for _, column := range table.Columns {
+		val := record[column.Name]
+		if val == nil {
+			continue
+		}
+		if column.IsPrimary && val != nil {
+			err := ApiError{
+				Status: http.StatusBadRequest,
+				Err:    fmt.Errorf("field %s have invalid type", column.Name),
+			}
+			t.respondError(w, err)
+			return
+		}
+
+		val, err := t.validateColumnValue(column, val)
+		if err != nil {
+			t.respondError(w, ApiError{Status: http.StatusBadRequest, Err: err})
+			return
+		}
+
+		builder.Set(column.Name, val)
+	}
+	builder.Where("AND", table.Primary().Name, recordID)
+
+	fmt.Println(builder.String())
+	result, err := t.db.ExecContext(req.Context(), builder.String(), builder.Args()...)
+	if err != nil {
+		log.Println(err)
+		t.respondError(w, errInternal)
+		return
+	}
+
+	affected, err := result.RowsAffected()
+	if err != nil {
+		log.Println(err)
+		t.respondError(w, errInternal)
+		return
+	}
+
+	body := map[string]int64{"updated": affected}
+	t.successRespond(w, http.StatusOK, body)
 }
 
 func (t *TableHandler) createRecordsFromRows(rows *sql.Rows) ([]Record, error) {
@@ -548,6 +625,27 @@ func (t *TableHandler) createRecordsFromRows(rows *sql.Rows) ([]Record, error) {
 	}
 
 	return records, nil
+}
+
+func (t *TableHandler) validateColumnValue(column *Column, val interface{}) (interface{}, error) {
+	switch column.Type {
+	case IntType, FloatType:
+		floatVal, ok := val.(float64)
+		if !ok {
+			return nil, fmt.Errorf("field %s have invalid type", column.Name)
+		}
+
+		if column.Type == IntType {
+			return int(floatVal), nil
+		}
+	case VarcharType, TextType:
+		_, ok := val.(string)
+		if !ok {
+			return nil, fmt.Errorf("field %s have invalid type", column.Name)
+		}
+	}
+
+	return val, nil
 }
 
 func (t *TableHandler) successRespond(w http.ResponseWriter, statusCode int, response interface{}) {

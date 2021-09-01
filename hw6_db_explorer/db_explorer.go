@@ -273,6 +273,40 @@ func (b *UpdateQueryBuilder) Args() []interface{} {
 	return b.args
 }
 
+type DeleteQueryBuilder struct {
+	builder strings.Builder
+	args    []interface{}
+
+	wasWhere bool
+}
+
+func (b *DeleteQueryBuilder) Delete(tableName string) *DeleteQueryBuilder {
+	b.builder.WriteString(fmt.Sprintf("DELETE FROM `%s`", tableName))
+	return b
+}
+
+func (b *DeleteQueryBuilder) Where(op, columnName string, arg interface{}) *DeleteQueryBuilder {
+	b.builder.WriteRune(' ')
+	if !b.wasWhere {
+		b.builder.WriteString("WHERE")
+		b.wasWhere = true
+	} else {
+		b.builder.WriteString(op)
+	}
+
+	b.builder.WriteString(fmt.Sprintf(" `%s` = ?", columnName))
+	b.args = append(b.args, arg)
+	return b
+}
+
+func (b *DeleteQueryBuilder) String() string {
+	return b.builder.String()
+}
+
+func (b *DeleteQueryBuilder) Args() []interface{} {
+	return b.args
+}
+
 type ApiError struct {
 	Status int
 	Err    error
@@ -370,6 +404,7 @@ func (t *TableHandler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		case http.MethodPost:
 			t.handleRecordUpdate(w, req, table, recordID)
 		case http.MethodDelete:
+			t.handleRecordDelete(w, req, table, recordID)
 		default:
 			t.respondError(w, errNotAllowed)
 		}
@@ -562,6 +597,28 @@ func (t *TableHandler) handleRecordUpdate(w http.ResponseWriter, req *http.Reque
 	}
 
 	body := map[string]int64{"updated": affected}
+	t.successRespond(w, http.StatusOK, body)
+}
+
+func (t *TableHandler) handleRecordDelete(w http.ResponseWriter, req *http.Request, table *Table, recordID int) {
+	builder := &DeleteQueryBuilder{}
+	builder.Delete(table.Name).Where("AND", table.Primary().Name, recordID)
+
+	result, err := t.db.ExecContext(req.Context(), builder.String(), builder.Args()...)
+	if err != nil {
+		log.Println(err)
+		t.respondError(w, errInternal)
+		return
+	}
+
+	affected, err := result.RowsAffected()
+	if err != nil {
+		log.Println(err)
+		t.respondError(w, errInternal)
+		return
+	}
+
+	body := map[string]int64{"deleted": affected}
 	t.successRespond(w, http.StatusOK, body)
 }
 

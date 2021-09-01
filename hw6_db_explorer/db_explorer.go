@@ -3,12 +3,15 @@ package main
 import (
 	"context"
 	"database/sql"
+	"database/sql/driver"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
 	"net/http"
 	"regexp"
+	"strconv"
+	"strings"
 	"time"
 )
 
@@ -95,13 +98,77 @@ func getColumns(db *sql.DB, tableName string) ([]*Column, error) {
 	return columns, nil
 }
 
+type SimpleQueryBuilder struct {
+	builder strings.Builder
+	err     error
+
+	wasFrom  bool
+	wasWhere bool
+}
+
+func (b *SimpleQueryBuilder) From(table string) *SimpleQueryBuilder {
+	if b.err != nil {
+		return b
+	}
+	if b.wasFrom {
+		b.err = fmt.Errorf("failed to call From() twice or more")
+		return b
+	}
+
+	stmt := fmt.Sprintf("SELECT * FROM `%s`", table)
+	b.builder.WriteString(stmt)
+	b.wasFrom = true
+	return b
+}
+
+func (b *SimpleQueryBuilder) Limit(val int) *SimpleQueryBuilder {
+	if b.err != nil {
+		return b
+	}
+	if !b.wasFrom {
+		b.err = fmt.Errorf("failed to call Limit() before From()")
+		return b
+	}
+
+	stmt := fmt.Sprintf(" LIMIT %d", val)
+	b.builder.WriteString(stmt)
+	return b
+}
+
+func (b *SimpleQueryBuilder) Offset(val int) *SimpleQueryBuilder {
+	if b.err != nil {
+		return b
+	}
+	if !b.wasFrom {
+		b.err = fmt.Errorf("failed to call Offset() before From()")
+		return b
+	}
+
+	stmt := fmt.Sprintf(" OFFSET %d", val)
+	b.builder.WriteString(stmt)
+	return b
+}
+
+func (b *SimpleQueryBuilder) Err() error {
+	return b.err
+}
+
+func (b *SimpleQueryBuilder) String() string {
+	return b.builder.String()
+}
+
 type ApiError struct {
 	Status int
 	Err    error
 }
 
 var (
-	errNotFound = ApiError{Status: http.StatusNotFound, Err: errors.New("resource is not found")}
+	errBadLimit         = ApiError{Status: http.StatusBadRequest, Err: errors.New("bad limit")}
+	errBadOffset        = ApiError{Status: http.StatusBadRequest, Err: errors.New("bad offset")}
+	errTableNotFound    = ApiError{Status: http.StatusNotFound, Err: errors.New("unknown table")}
+	errResourceNotFound = ApiError{Status: http.StatusNotFound, Err: errors.New("resource is not found")}
+	errNotAllowed       = ApiError{Status: http.StatusMethodNotAllowed, Err: errors.New("method is not allowed")}
+	errInternal         = ApiError{Status: http.StatusInternalServerError, Err: errors.New("internal server error")}
 )
 
 func (ae ApiError) Error() string {
@@ -113,13 +180,19 @@ type ResponseBody struct {
 	Response interface{} `json:"response,omitempty"`
 }
 
-type ResponseTableBody struct {
+type ResponseTablesBody struct {
 	Tables []string `json:"tables"`
 }
 
+type ResponseRecordsBody struct {
+	Records []map[string]interface{} `json:"records"`
+}
+
 type TableHandler struct {
-	db     *sql.DB
-	tables []*Table
+	db *sql.DB
+
+	tables    []*Table
+	tablesMap map[string]*Table
 
 	listRegex   *regexp.Regexp
 	detailRegex *regexp.Regexp
@@ -132,12 +205,39 @@ func (t *TableHandler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	case url == "/":
 		t.handleTableList(w)
 	case t.listRegex.MatchString(url):
-		fmt.Fprintln(w, "list")
+		groups := t.listRegex.FindStringSubmatch(url)
+		if len(groups) != 2 {
+			log.Println("")
+			if err := t.respondError(w, errInternal); err != nil {
+				log.Println(err)
+			}
+			return
+		}
+
+		tableName := groups[1]
+		table, exist := t.tablesMap[tableName]
+		if !exist {
+			if err := t.respondError(w, errTableNotFound); err != nil {
+				log.Println(err)
+			}
+			return
+		}
+
+		switch req.Method {
+		case http.MethodGet:
+			t.handleRecordList(w, req, table)
+		case http.MethodPut:
+
+		default:
+			if err := t.respondError(w, errNotAllowed); err != nil {
+				log.Println(err)
+			}
+		}
 	case t.detailRegex.MatchString(url):
 		groups := t.detailRegex.FindStringSubmatch(url)
 		fmt.Fprintln(w, "detail", "id = ", groups[1])
 	default:
-		if err := t.respondError(w, errNotFound); err != nil {
+		if err := t.respondError(w, errResourceNotFound); err != nil {
 			log.Println(err)
 		}
 	}
@@ -149,13 +249,130 @@ func (t *TableHandler) handleTableList(w http.ResponseWriter) {
 		tableNames = append(tableNames, table.Name)
 	}
 
-	respBody := ResponseBody{Response: ResponseTableBody{tableNames}}
+	respBody := ResponseBody{Response: ResponseTablesBody{tableNames}}
 	payload, err := json.Marshal(respBody)
 	if err != nil {
 		if err = t.respondError(w, err); err != nil {
 			log.Println(err)
 		}
 
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_, err = w.Write(payload)
+	if err != nil {
+		log.Printf("error occurred during write to response writer due %v", err)
+	}
+}
+
+func (t *TableHandler) handleRecordList(w http.ResponseWriter, req *http.Request, table *Table) {
+	query := req.URL.Query()
+
+	var err error
+	limit := 5
+	if limitStr := query.Get("limit"); limitStr != "" {
+		limit, err = strconv.Atoi(limitStr)
+		if err != nil {
+			log.Println(err)
+			if err = t.respondError(w, errBadLimit); err != nil {
+				log.Println(err)
+			}
+			return
+		}
+	}
+
+	offset := 0
+	if offsetStr := query.Get("offset"); offsetStr != "" {
+		offset, err = strconv.Atoi(offsetStr)
+		if err != nil {
+			log.Println(err)
+			if err = t.respondError(w, errBadOffset); err != nil {
+				log.Println(err)
+			}
+		}
+	}
+
+	builder := &SimpleQueryBuilder{}
+	builder.From(table.Name).Limit(limit).Offset(offset)
+	if err = builder.Err(); err != nil {
+		log.Println(err)
+		if err = t.respondError(w, errInternal); err != nil {
+			log.Println(err)
+		}
+		return
+	}
+
+	rows, err := t.db.QueryContext(req.Context(), builder.String())
+	if err != nil {
+		log.Println(err)
+		_ = t.respondError(w, errInternal)
+		return
+	}
+
+	columnsTypes, err := rows.ColumnTypes()
+	if err != nil {
+		log.Println(err)
+		_ = t.respondError(w, errInternal)
+		return
+	}
+
+	records := make([]map[string]interface{}, 0)
+	for rows.Next() {
+		vals := make([]interface{}, len(columnsTypes))
+		for i, columnType := range columnsTypes {
+			dbType := columnType.DatabaseTypeName()
+			if nullable, _ := columnType.Nullable(); nullable {
+				switch dbType {
+				case "INT":
+					vals[i] = new(sql.NullInt64)
+				case "FLOAT":
+					vals[i] = new(sql.NullFloat64)
+				case "VARCHAR", "TEXT":
+					vals[i] = new(sql.NullString)
+				}
+			} else {
+				switch dbType {
+				case "INT":
+					vals[i] = new(int64)
+				case "FLOAT":
+					vals[i] = new(float64)
+				case "VARCHAR", "TEXT":
+					vals[i] = new(string)
+				}
+			}
+		}
+
+		record := make(map[string]interface{}, len(columnsTypes))
+		if err = rows.Scan(vals...); err != nil {
+			log.Println(err)
+			_ = t.respondError(w, errInternal)
+			return
+		}
+
+		for i, columnType := range columnsTypes {
+			if valuer, ok := vals[i].(driver.Valuer); ok {
+				val, err := valuer.Value()
+				if err != nil {
+					log.Println(err)
+					_ = t.respondError(w, errInternal)
+					return
+				}
+
+				record[columnType.Name()] = val
+			} else {
+				record[columnType.Name()] = vals[i]
+			}
+		}
+		records = append(records, record)
+	}
+
+	respBody := ResponseBody{Response: ResponseRecordsBody{records}}
+	payload, err := json.Marshal(respBody)
+	if err != nil {
+		log.Println(err)
+		_ = t.respondError(w, errInternal)
 		return
 	}
 
@@ -199,6 +416,8 @@ func NewDbExplorer(db *sql.DB) (http.Handler, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to get tables: %v", err)
 	}
+
+	tablesMap := make(map[string]*Table, len(tables))
 	for _, table := range tables {
 		columns, err := getColumns(db, table.Name)
 		if err != nil {
@@ -206,13 +425,15 @@ func NewDbExplorer(db *sql.DB) (http.Handler, error) {
 		}
 
 		table.Columns = columns
+		tablesMap[table.Name] = table
 	}
 
 	mux.Handle("/", &TableHandler{
 		db:          db,
 		tables:      tables,
-		listRegex:   regexp.MustCompile(`^/table/?$`),
-		detailRegex: regexp.MustCompile(`^/table/(\d+)$`),
+		tablesMap:   tablesMap,
+		listRegex:   regexp.MustCompile(`^/([a-zA-Z0-9_-]+)/?$`),
+		detailRegex: regexp.MustCompile(`^/([a-zA-Z0-9_-]+)/(\d+)$`),
 	})
 	return mux, nil
 }

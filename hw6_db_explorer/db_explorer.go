@@ -136,20 +136,14 @@ func getColumns(db *sql.DB, tableName string) ([]*Column, error) {
 	return columns, nil
 }
 
-type SelectQueryBuilder struct {
+type ConditionQueryBuilder struct {
 	builder strings.Builder
 	args    []interface{}
 
 	wasWhere bool
 }
 
-func (b *SelectQueryBuilder) From(table string) *SelectQueryBuilder {
-	stmt := fmt.Sprintf("SELECT * FROM `%s`", table)
-	b.builder.WriteString(stmt)
-	return b
-}
-
-func (b *SelectQueryBuilder) Where(op, column string, arg interface{}) *SelectQueryBuilder {
+func (b *ConditionQueryBuilder) Where(op, column string, arg interface{}) *ConditionQueryBuilder {
 	b.builder.WriteRune(' ')
 	if !b.wasWhere {
 		b.builder.WriteString("WHERE")
@@ -160,6 +154,29 @@ func (b *SelectQueryBuilder) Where(op, column string, arg interface{}) *SelectQu
 
 	b.builder.WriteString(fmt.Sprintf(" `%s` = ?", column))
 	b.args = append(b.args, arg)
+	return b
+}
+
+func (b *ConditionQueryBuilder) String() string {
+	return b.builder.String()
+}
+
+func (b *ConditionQueryBuilder) Args() []interface{} {
+	return b.args
+}
+
+type SelectQueryBuilder struct {
+	ConditionQueryBuilder
+}
+
+func (b *SelectQueryBuilder) Select(table string) *SelectQueryBuilder {
+	stmt := fmt.Sprintf("SELECT * FROM `%s`", table)
+	b.builder.WriteString(stmt)
+	return b
+}
+
+func (b *SelectQueryBuilder) Where(op, column string, arg interface{}) *SelectQueryBuilder {
+	b.ConditionQueryBuilder.Where(op, column, arg)
 	return b
 }
 
@@ -175,14 +192,6 @@ func (b *SelectQueryBuilder) Offset(val int) *SelectQueryBuilder {
 	return b
 }
 
-func (b *SelectQueryBuilder) String() string {
-	return b.builder.String()
-}
-
-func (b *SelectQueryBuilder) Args() []interface{} {
-	return b.args
-}
-
 type InsertQueryBuilder struct {
 	builder strings.Builder
 	args    []interface{}
@@ -190,12 +199,12 @@ type InsertQueryBuilder struct {
 	wasBuilt bool
 }
 
-func (b *InsertQueryBuilder) Into(tableName string) *InsertQueryBuilder {
+func (b *InsertQueryBuilder) Insert(tableName string) *InsertQueryBuilder {
 	b.builder.WriteString(fmt.Sprintf("INSERT INTO `%s` (", tableName))
 	return b
 }
 
-func (b *InsertQueryBuilder) Insert(columnName string, arg interface{}) *InsertQueryBuilder {
+func (b *InsertQueryBuilder) Add(columnName string, arg interface{}) *InsertQueryBuilder {
 	if len(b.args) != 0 {
 		b.builder.WriteString(", ")
 	}
@@ -225,11 +234,9 @@ func (b *InsertQueryBuilder) Args() []interface{} {
 }
 
 type UpdateQueryBuilder struct {
-	builder strings.Builder
-	args    []interface{}
+	ConditionQueryBuilder
 
-	wasSet   bool
-	wasWhere bool
+	wasSet bool
 }
 
 func (b *UpdateQueryBuilder) Table(tableName string) *UpdateQueryBuilder {
@@ -251,32 +258,12 @@ func (b *UpdateQueryBuilder) Set(columnName string, arg interface{}) *UpdateQuer
 }
 
 func (b *UpdateQueryBuilder) Where(op, columnName string, arg interface{}) *UpdateQueryBuilder {
-	b.builder.WriteRune(' ')
-	if !b.wasWhere {
-		b.builder.WriteString("WHERE")
-		b.wasWhere = true
-	} else {
-		b.builder.WriteString(op)
-	}
-
-	b.builder.WriteString(fmt.Sprintf(" `%s` = ?", columnName))
-	b.args = append(b.args, arg)
+	b.ConditionQueryBuilder.Where(op, columnName, arg)
 	return b
 }
 
-func (b *UpdateQueryBuilder) String() string {
-	return b.builder.String()
-}
-
-func (b *UpdateQueryBuilder) Args() []interface{} {
-	return b.args
-}
-
 type DeleteQueryBuilder struct {
-	builder strings.Builder
-	args    []interface{}
-
-	wasWhere bool
+	ConditionQueryBuilder
 }
 
 func (b *DeleteQueryBuilder) Delete(tableName string) *DeleteQueryBuilder {
@@ -285,25 +272,8 @@ func (b *DeleteQueryBuilder) Delete(tableName string) *DeleteQueryBuilder {
 }
 
 func (b *DeleteQueryBuilder) Where(op, columnName string, arg interface{}) *DeleteQueryBuilder {
-	b.builder.WriteRune(' ')
-	if !b.wasWhere {
-		b.builder.WriteString("WHERE")
-		b.wasWhere = true
-	} else {
-		b.builder.WriteString(op)
-	}
-
-	b.builder.WriteString(fmt.Sprintf(" `%s` = ?", columnName))
-	b.args = append(b.args, arg)
+	b.ConditionQueryBuilder.Where(op, columnName, arg)
 	return b
-}
-
-func (b *DeleteQueryBuilder) String() string {
-	return b.builder.String()
-}
-
-func (b *DeleteQueryBuilder) Args() []interface{} {
-	return b.args
 }
 
 type ApiError struct {
@@ -445,7 +415,7 @@ func (t *TableHandler) handleRecordList(w http.ResponseWriter, req *http.Request
 	}
 
 	builder := &SelectQueryBuilder{}
-	builder.From(table.Name).Limit(limit).Offset(offset)
+	builder.Select(table.Name).Limit(limit).Offset(offset)
 
 	rows, err := t.db.QueryContext(req.Context(), builder.String())
 	if err != nil {
@@ -474,7 +444,7 @@ func (t *TableHandler) handleRecordCreate(w http.ResponseWriter, req *http.Reque
 	defer func() { _ = req.Body.Close() }()
 
 	builder := InsertQueryBuilder{}
-	builder.Into(table.Name)
+	builder.Insert(table.Name)
 	for _, column := range table.Columns {
 		if column.IsAutoIncrement {
 			continue
@@ -502,7 +472,7 @@ func (t *TableHandler) handleRecordCreate(w http.ResponseWriter, req *http.Reque
 			return
 		}
 
-		builder.Insert(column.Name, val)
+		builder.Add(column.Name, val)
 	}
 
 	result, err := t.db.ExecContext(req.Context(), builder.String(), builder.Args()...)
@@ -525,7 +495,7 @@ func (t *TableHandler) handleRecordCreate(w http.ResponseWriter, req *http.Reque
 
 func (t *TableHandler) handleRecordDetail(w http.ResponseWriter, req *http.Request, table *Table, recordID int) {
 	builder := &SelectQueryBuilder{}
-	builder.From(table.Name).Where("", table.Primary().Name, recordID).Limit(1)
+	builder.Select(table.Name).Where("", table.Primary().Name, recordID).Limit(1)
 
 	rows, err := t.db.QueryContext(req.Context(), builder.String(), builder.Args()...)
 	if err != nil {

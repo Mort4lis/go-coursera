@@ -51,6 +51,19 @@ type Column struct {
 	IsAutoIncrement bool
 }
 
+func (c *Column) DefaultValue() interface{} {
+	switch c.Type {
+	case IntType:
+		return 0
+	case FloatType:
+		return 0.0
+	case VarcharType, TextType:
+		return ""
+	}
+
+	return nil
+}
+
 type Record map[string]interface{}
 
 func getTables(db *sql.DB) ([]*Table, error) {
@@ -452,18 +465,11 @@ func (t *TableHandler) handleRecordCreate(w http.ResponseWriter, req *http.Reque
 
 		val := record[column.Name]
 		if val == nil {
-			if column.IsNullable {
-				continue
+			if !column.IsNullable {
+				builder.Add(column.Name, column.DefaultValue())
 			}
 
-			switch column.Type {
-			case IntType:
-				val = 0
-			case FloatType:
-				val = 0.0
-			case VarcharType, TextType:
-				val = ""
-			}
+			continue
 		}
 
 		val, err := t.validateColumnValue(column, val)

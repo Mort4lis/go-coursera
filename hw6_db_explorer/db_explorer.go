@@ -3,7 +3,10 @@ package main
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
+	"errors"
 	"fmt"
+	"log"
 	"net/http"
 	"regexp"
 	"time"
@@ -92,8 +95,32 @@ func getColumns(db *sql.DB, tableName string) ([]*Column, error) {
 	return columns, nil
 }
 
+type ApiError struct {
+	Status int
+	Err    error
+}
+
+var (
+	errNotFound = ApiError{Status: http.StatusNotFound, Err: errors.New("resource is not found")}
+)
+
+func (ae ApiError) Error() string {
+	return ae.Err.Error()
+}
+
+type ResponseBody struct {
+	Error    string      `json:"error,omitempty"`
+	Response interface{} `json:"response,omitempty"`
+}
+
+type ResponseTableBody struct {
+	Tables []string `json:"tables"`
+}
+
 type TableHandler struct {
-	db          *sql.DB
+	db     *sql.DB
+	tables []*Table
+
 	listRegex   *regexp.Regexp
 	detailRegex *regexp.Regexp
 }
@@ -103,15 +130,66 @@ func (t *TableHandler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 
 	switch {
 	case url == "/":
-		fmt.Fprintln(w, "root")
+		t.handleTableList(w)
 	case t.listRegex.MatchString(url):
 		fmt.Fprintln(w, "list")
 	case t.detailRegex.MatchString(url):
 		groups := t.detailRegex.FindStringSubmatch(url)
 		fmt.Fprintln(w, "detail", "id = ", groups[1])
 	default:
-		fmt.Fprintln(w, "not found")
+		if err := t.respondError(w, errNotFound); err != nil {
+			log.Println(err)
+		}
 	}
+}
+
+func (t *TableHandler) handleTableList(w http.ResponseWriter) {
+	tableNames := make([]string, 0, len(t.tables))
+	for _, table := range t.tables {
+		tableNames = append(tableNames, table.Name)
+	}
+
+	respBody := ResponseBody{Response: ResponseTableBody{tableNames}}
+	payload, err := json.Marshal(respBody)
+	if err != nil {
+		if err = t.respondError(w, err); err != nil {
+			log.Println(err)
+		}
+
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_, err = w.Write(payload)
+	if err != nil {
+		log.Printf("error occurred during write to response writer due %v", err)
+	}
+}
+
+func (t *TableHandler) respondError(w http.ResponseWriter, err error) error {
+	if apiErr, ok := err.(ApiError); ok {
+		view := ResponseBody{Error: apiErr.Err.Error()}
+
+		payload, err := json.Marshal(view)
+		if err != nil {
+			return fmt.Errorf("failed to marshal error due %v", err)
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(apiErr.Status)
+		_, err = w.Write(payload)
+		if err != nil {
+			return fmt.Errorf("failed to write response body due %v", err)
+		}
+
+		return nil
+	}
+
+	return t.respondError(w, ApiError{
+		Status: http.StatusInternalServerError,
+		Err:    err,
+	})
 }
 
 func NewDbExplorer(db *sql.DB) (http.Handler, error) {
@@ -132,6 +210,7 @@ func NewDbExplorer(db *sql.DB) (http.Handler, error) {
 
 	mux.Handle("/", &TableHandler{
 		db:          db,
+		tables:      tables,
 		listRegex:   regexp.MustCompile(`^/table/?$`),
 		detailRegex: regexp.MustCompile(`^/table/(\d+)$`),
 	})

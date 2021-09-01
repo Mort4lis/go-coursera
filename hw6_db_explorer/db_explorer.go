@@ -25,11 +25,18 @@ const (
 type Table struct {
 	Name    string
 	Columns []*Column
+
+	primary *Column
 }
 
 func (t *Table) Primary() *Column {
+	if t.primary != nil {
+		return t.primary
+	}
+
 	for _, column := range t.Columns {
 		if column.IsPrimary {
+			t.primary = column
 			return column
 		}
 	}
@@ -378,13 +385,6 @@ func (t *TableHandler) handleRecordList(w http.ResponseWriter, req *http.Request
 }
 
 func (t *TableHandler) handleRecordCreate(w http.ResponseWriter, req *http.Request, table *Table) {
-	primary := table.Primary()
-	if primary == nil {
-		log.Printf("table %s doesn't have the primary key", table.Name)
-		t.respondError(w, errInternal)
-		return
-	}
-
 	var record Record
 	if err := json.NewDecoder(req.Body).Decode(&record); err != nil {
 		log.Println(err)
@@ -458,20 +458,13 @@ func (t *TableHandler) handleRecordCreate(w http.ResponseWriter, req *http.Reque
 		return
 	}
 
-	body := map[string]int64{primary.Name: lastInsertID}
+	body := map[string]int64{table.Primary().Name: lastInsertID}
 	t.successRespond(w, http.StatusCreated, body)
 }
 
 func (t *TableHandler) handleRecordDetail(w http.ResponseWriter, req *http.Request, table *Table, recordID int) {
-	primary := table.Primary()
-	if primary == nil {
-		log.Printf("table %s doesn't have the primary key", table.Name)
-		t.respondError(w, errInternal)
-		return
-	}
-
 	builder := &SelectQueryBuilder{}
-	builder.From(table.Name).And(primary.Name, recordID).Limit(1)
+	builder.From(table.Name).And(table.Primary().Name, recordID).Limit(1)
 
 	rows, err := t.db.QueryContext(req.Context(), builder.String(), builder.Args()...)
 	if err != nil {
@@ -616,6 +609,10 @@ func NewDbExplorer(db *sql.DB) (http.Handler, error) {
 		}
 
 		table.Columns = columns
+		if table.Primary() == nil {
+			return nil, fmt.Errorf("table %s doesn't have the primary key", table.Name)
+		}
+
 		tablesMap[table.Name] = table
 	}
 

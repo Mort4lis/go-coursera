@@ -181,6 +181,47 @@ func (b *SelectQueryBuilder) Args() []interface{} {
 	return b.args
 }
 
+type InsertQueryBuilder struct {
+	builder strings.Builder
+	args    []interface{}
+
+	wasBuilt bool
+}
+
+func (b *InsertQueryBuilder) Into(tableName string) *InsertQueryBuilder {
+	b.builder.WriteString(fmt.Sprintf("INSERT INTO `%s` (", tableName))
+	return b
+}
+
+func (b *InsertQueryBuilder) Add(columnName string, arg interface{}) *InsertQueryBuilder {
+	if len(b.args) != 0 {
+		b.builder.WriteString(", ")
+	}
+
+	b.builder.WriteString(fmt.Sprintf("`%s`", columnName))
+	b.args = append(b.args, arg)
+	return b
+}
+
+func (b *InsertQueryBuilder) String() string {
+	if !b.wasBuilt {
+		b.builder.WriteString(") VALUES (")
+		for i := range b.args {
+			if i != 0 {
+				b.builder.WriteString(", ")
+			}
+			b.builder.WriteRune('?')
+		}
+		b.builder.WriteRune(')')
+		b.wasBuilt = true
+	}
+	return b.builder.String()
+}
+
+func (b *InsertQueryBuilder) Args() []interface{} {
+	return b.args
+}
+
 type ApiError struct {
 	Status int
 	Err    error
@@ -252,6 +293,7 @@ func (t *TableHandler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		case http.MethodGet:
 			t.handleRecordList(w, req, table)
 		case http.MethodPut:
+			t.handleRecordCreate(w, req, table)
 		default:
 			t.respondError(w, errNotAllowed)
 		}
@@ -333,6 +375,91 @@ func (t *TableHandler) handleRecordList(w http.ResponseWriter, req *http.Request
 	}
 
 	t.successRespond(w, http.StatusOK, ResponseRecordsBody{records})
+}
+
+func (t *TableHandler) handleRecordCreate(w http.ResponseWriter, req *http.Request, table *Table) {
+	primary := table.Primary()
+	if primary == nil {
+		log.Printf("table %s doesn't have the primary key", table.Name)
+		t.respondError(w, errInternal)
+		return
+	}
+
+	var record Record
+	if err := json.NewDecoder(req.Body).Decode(&record); err != nil {
+		log.Println(err)
+		t.respondError(w, errInternal)
+		return
+	}
+	defer func() { _ = req.Body.Close() }()
+
+	builder := InsertQueryBuilder{}
+	builder.Into(table.Name)
+	for _, column := range table.Columns {
+		if column.IsAutoIncrement {
+			continue
+		}
+
+		val := record[column.Name]
+		if column.IsNullable && val == nil {
+			continue
+		}
+		if !column.IsNullable && val == nil {
+			err := ApiError{
+				Status: http.StatusBadRequest,
+				Err:    fmt.Errorf("%s must be required", column.Name),
+			}
+			t.respondError(w, err)
+			return
+		}
+
+		switch column.Type {
+		case IntType, FloatType:
+			floatVal, ok := val.(float64)
+			if !ok {
+				err := ApiError{
+					Status: http.StatusBadRequest,
+					Err:    fmt.Errorf("field %s have invalid type", column.Name),
+				}
+				t.respondError(w, err)
+				return
+			}
+
+			if column.Type == IntType {
+				builder.Add(column.Name, int(floatVal))
+			} else {
+				builder.Add(column.Name, floatVal)
+			}
+		case VarcharType, TextType:
+			strVal, ok := val.(string)
+			if !ok {
+				err := ApiError{
+					Status: http.StatusBadRequest,
+					Err:    fmt.Errorf("field %s have invalid type", column.Name),
+				}
+				t.respondError(w, err)
+				return
+			}
+			builder.Add(column.Name, strVal)
+		}
+	}
+
+	result, err := t.db.ExecContext(req.Context(), builder.String(), builder.Args()...)
+	if err != nil {
+		log.Println(err)
+		t.respondError(w, errInternal)
+		return
+	}
+
+	lastInsertID, err := result.LastInsertId()
+	if err != nil {
+		log.Println(err)
+		t.respondError(w, errInternal)
+		return
+	}
+
+	body := map[string]int64{primary.Name: lastInsertID}
+	t.successRespond(w, http.StatusCreated, body)
 }
 
 func (t *TableHandler) handleRecordDetail(w http.ResponseWriter, req *http.Request, table *Table, recordID int) {
@@ -418,6 +545,13 @@ func (t *TableHandler) createRecordsFromRows(rows *sql.Rows) ([]Record, error) {
 			}
 		}
 		records = append(records, record)
+	}
+
+	if err = rows.Close(); err != nil {
+		return nil, fmt.Errorf("error occurred during closing rows due %v", err)
+	}
+	if err = rows.Err(); err != nil {
+		return nil, fmt.Errorf("error occurred rows iteration due %v", err)
 	}
 
 	return records, nil

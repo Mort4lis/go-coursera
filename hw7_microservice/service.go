@@ -114,26 +114,6 @@ func (m *ACLManager) HasAccess(key, val string) bool {
 	return false
 }
 
-type ACLMethodManager struct {
-	mdKey   string
-	manager *ACLManager
-}
-
-func (i *ACLMethodManager) HasAccess(ctx context.Context, method string) bool {
-	md, ok := metadata.FromIncomingContext(ctx)
-	if !ok {
-		return false
-	}
-
-	for _, k := range md.Get(i.mdKey) {
-		if i.manager.HasAccess(k, method) {
-			return true
-		}
-	}
-
-	return false
-}
-
 type MethodCallEvent struct {
 	Timestamp int64
 	Consumer  string
@@ -180,104 +160,119 @@ func (p *MethodCallPublisher) Unsubscribe(subscribeID int) {
 	delete(p.subscribers, subscribeID)
 }
 
-func aclUnaryInterceptor(manager *ACLMethodManager) grpc.UnaryServerInterceptor {
+type ACLInterceptor struct {
+	consumerKey string
+	manager     *ACLManager
+}
+
+func (i *ACLInterceptor) Unary() grpc.UnaryServerInterceptor {
 	return func(
 		ctx context.Context,
 		req interface{},
 		info *grpc.UnaryServerInfo,
 		handler grpc.UnaryHandler,
 	) (resp interface{}, err error) {
-		if manager.HasAccess(ctx, info.FullMethod) {
-			return handler(ctx, req)
+		err = i.do(ctx, info.FullMethod)
+		if err != nil {
+			return nil, err
 		}
-		return nil, status.Error(
-			codes.Unauthenticated,
-			"consumer doesn't have permissions to call this method",
-		)
+		return handler(ctx, req)
 	}
 }
 
-func aclStreamInterceptor(manager *ACLMethodManager) grpc.StreamServerInterceptor {
+func (i *ACLInterceptor) Stream() grpc.StreamServerInterceptor {
 	return func(
 		srv interface{},
 		stream grpc.ServerStream,
 		info *grpc.StreamServerInfo,
 		handler grpc.StreamHandler,
 	) error {
-		if manager.HasAccess(stream.Context(), info.FullMethod) {
-			return handler(srv, stream)
+		err := i.do(stream.Context(), info.FullMethod)
+		if err != nil {
+			return err
 		}
+		return handler(srv, stream)
+	}
+}
+
+func (i *ACLInterceptor) do(ctx context.Context, method string) error {
+	md, ok := metadata.FromIncomingContext(ctx)
+	if !ok {
 		return status.Error(
 			codes.Unauthenticated,
 			"consumer doesn't have permissions to call this method",
 		)
 	}
+
+	for _, k := range md.Get(i.consumerKey) {
+		if i.manager.HasAccess(k, method) {
+			return nil
+		}
+	}
+
+	return status.Error(
+		codes.Unauthenticated,
+		"consumer doesn't have permissions to call this method",
+	)
 }
 
-func notifyUnaryMethodCallInterceptor(publisher *MethodCallPublisher) grpc.UnaryServerInterceptor {
+type MethodCallNotifyInterceptor struct {
+	consumerKey string
+	publisher   *MethodCallPublisher
+}
+
+func (i *MethodCallNotifyInterceptor) Unary() grpc.UnaryServerInterceptor {
 	return func(
 		ctx context.Context,
 		req interface{},
 		info *grpc.UnaryServerInfo,
 		handler grpc.UnaryHandler,
 	) (resp interface{}, err error) {
-		md, ok := metadata.FromIncomingContext(ctx)
-		if !ok {
-			return handler(ctx, req)
+		if err = i.do(ctx, info.FullMethod); err != nil {
+			return nil, err
 		}
-
-		pr, ok := peer.FromContext(ctx)
-		if !ok {
-			return handler(ctx, req)
-		}
-
-		consumers := md.Get("consumer")
-		if len(consumers) == 0 {
-			return handler(ctx, req)
-		}
-
-		event := MethodCallEvent{
-			Consumer: consumers[0],
-			Method:   info.FullMethod,
-			Host:     pr.Addr.String(),
-		}
-		publisher.Notify(event)
-
 		return handler(ctx, req)
 	}
 }
 
-func notifyStreamMethodCallInterceptor(publisher *MethodCallPublisher) grpc.StreamServerInterceptor {
+func (i *MethodCallNotifyInterceptor) Stream() grpc.StreamServerInterceptor {
 	return func(
 		srv interface{},
 		stream grpc.ServerStream,
 		info *grpc.StreamServerInfo,
 		handler grpc.StreamHandler,
 	) error {
-		md, ok := metadata.FromIncomingContext(stream.Context())
-		if !ok {
-			return handler(srv, stream)
+		if err := i.do(stream.Context(), info.FullMethod); err != nil {
+			return err
 		}
-
-		pr, ok := peer.FromContext(stream.Context())
-		if !ok {
-			return handler(srv, stream)
-		}
-
-		consumers := md.Get("consumer")
-		if len(consumers) == 0 {
-			return handler(srv, stream)
-		}
-
-		event := MethodCallEvent{
-			Consumer: consumers[0],
-			Method:   info.FullMethod,
-			Host:     pr.Addr.String(),
-		}
-		publisher.Notify(event)
-
 		return handler(srv, stream)
 	}
+}
+
+func (i *MethodCallNotifyInterceptor) do(ctx context.Context, method string) error {
+	md, ok := metadata.FromIncomingContext(ctx)
+	if !ok {
+		return nil
+	}
+
+	pr, ok := peer.FromContext(ctx)
+	if !ok {
+		return nil
+	}
+
+	consumers := md.Get(i.consumerKey)
+	if len(consumers) == 0 {
+		return nil
+	}
+
+	event := MethodCallEvent{
+		Consumer: consumers[0],
+		Method:   method,
+		Host:     pr.Addr.String(),
+	}
+
+	i.publisher.Notify(event)
+	return nil
 }
 
 func asyncServe(ctx context.Context, server *grpc.Server, lis net.Listener) {
@@ -296,30 +291,36 @@ func asyncServe(ctx context.Context, server *grpc.Server, lis net.Listener) {
 }
 
 func StartMyMicroservice(ctx context.Context, addr, aclStr string) error {
+	const consumerKey = "consumer"
+
 	lis, err := net.Listen("tcp", addr)
 	if err != nil {
 		return fmt.Errorf("failed to listen tcp socket %s: %v", addr, err)
 	}
 
+	publisher := NewMethodCallPublisher()
 	aclManager := &ACLManager{}
 	if err = aclManager.Load([]byte(aclStr)); err != nil {
 		return err
 	}
-	aclMethodManager := &ACLMethodManager{
-		mdKey:   "consumer",
-		manager: aclManager,
-	}
 
-	publisher := NewMethodCallPublisher()
+	aclInterceptor := &ACLInterceptor{
+		consumerKey: consumerKey,
+		manager:     aclManager,
+	}
+	mcInterceptor := &MethodCallNotifyInterceptor{
+		consumerKey: consumerKey,
+		publisher:   publisher,
+	}
 
 	server := grpc.NewServer(
 		grpc.ChainUnaryInterceptor(
-			aclUnaryInterceptor(aclMethodManager),
-			notifyUnaryMethodCallInterceptor(publisher),
+			aclInterceptor.Unary(),
+			mcInterceptor.Unary(),
 		),
 		grpc.ChainStreamInterceptor(
-			aclStreamInterceptor(aclMethodManager),
-			notifyStreamMethodCallInterceptor(publisher),
+			aclInterceptor.Stream(),
+			mcInterceptor.Stream(),
 		),
 	)
 	RegisterBizServer(server, &BizManager{})

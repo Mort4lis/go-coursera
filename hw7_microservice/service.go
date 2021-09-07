@@ -57,12 +57,36 @@ func (a *AdminManager) Logging(nothing *Nothing, stream Admin_LoggingServer) err
 }
 
 func (a *AdminManager) Statistics(interval *StatInterval, stream Admin_StatisticsServer) error {
-	stream.Send(&Stat{
-		Timestamp:  0,
-		ByMethod:   nil,
-		ByConsumer: nil,
-	})
-	return nil
+	eventCh, subscribeID := a.publisher.Subscribe()
+	defer a.publisher.Unsubscribe(subscribeID)
+
+	stat := new(Stat)
+	ticker := time.NewTicker(time.Duration(interval.IntervalSeconds) * time.Second)
+
+	for {
+		if stat.ByMethod == nil {
+			stat.ByMethod = make(map[string]uint64)
+		}
+		if stat.ByConsumer == nil {
+			stat.ByConsumer = make(map[string]uint64)
+		}
+
+		select {
+		case event := <-eventCh:
+			stat.ByMethod[event.Method]++
+			stat.ByConsumer[event.Consumer]++
+		case <-ticker.C:
+			stat.Timestamp = time.Now().Unix()
+			if err := stream.Send(stat); err != nil {
+				return status.Error(codes.Internal, "failed to send statistics")
+			}
+
+			stat.Reset()
+		case <-stream.Context().Done():
+			ticker.Stop()
+			return nil
+		}
+	}
 }
 
 type ACLManager struct {
@@ -149,7 +173,7 @@ func (p *MethodCallPublisher) Subscribe() (ch <-chan MethodCallEvent, subscribeI
 
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	p.subscribers[subscriberID] = make(chan MethodCallEvent)
+	p.subscribers[subscriberID] = make(chan MethodCallEvent, 1)
 
 	return p.subscribers[subscriberID], subscriberID
 }
@@ -293,14 +317,9 @@ func asyncServe(ctx context.Context, server *grpc.Server, lis net.Listener) {
 func StartMyMicroservice(ctx context.Context, addr, aclStr string) error {
 	const consumerKey = "consumer"
 
-	lis, err := net.Listen("tcp", addr)
-	if err != nil {
-		return fmt.Errorf("failed to listen tcp socket %s: %v", addr, err)
-	}
-
 	publisher := NewMethodCallPublisher()
 	aclManager := &ACLManager{}
-	if err = aclManager.Load([]byte(aclStr)); err != nil {
+	if err := aclManager.Load([]byte(aclStr)); err != nil {
 		return err
 	}
 
@@ -325,6 +344,11 @@ func StartMyMicroservice(ctx context.Context, addr, aclStr string) error {
 	)
 	RegisterBizServer(server, &BizManager{})
 	RegisterAdminServer(server, &AdminManager{publisher: publisher})
+
+	lis, err := net.Listen("tcp", addr)
+	if err != nil {
+		return fmt.Errorf("failed to listen tcp socket %s: %v", addr, err)
+	}
 
 	go asyncServe(ctx, server, lis)
 	return nil

@@ -13,7 +13,7 @@ func i2s(data interface{}, out interface{}) error {
 
 	outVal = outVal.Elem()
 	if !outVal.CanSet() {
-		return fmt.Errorf("out argument can't be set")
+		return fmt.Errorf("out argument must be set")
 	}
 
 	switch in := data.(type) {
@@ -85,7 +85,7 @@ func parseStruct(in map[string]interface{}, outVal reflect.Value) error {
 		case reflect.Struct:
 			m, ok := inVal.(map[string]interface{})
 			if !ok {
-				return fmt.Errorf("")
+				return fmt.Errorf("failed to assert type %T to map", inVal)
 			}
 
 			if err := parseStruct(m, fieldVal); err != nil {
@@ -94,14 +94,14 @@ func parseStruct(in map[string]interface{}, outVal reflect.Value) error {
 		case reflect.Slice:
 			sl, ok := inVal.([]interface{})
 			if !ok {
-				return fmt.Errorf("")
+				return fmt.Errorf("failed to assert type %T to slice", inVal)
 			}
 
 			if err := parseSlice(sl, fieldVal); err != nil {
 				return err
 			}
 		default:
-			return fmt.Errorf("unsupport type %q to parse struct", fieldType)
+			return fmt.Errorf("unsupport type %q (fieldName=%q)", fieldType, fieldName)
 		}
 	}
 
@@ -116,7 +116,7 @@ func parseSlice(sl []interface{}, outVal reflect.Value) error {
 	for _, elem := range sl {
 		m, ok := elem.(map[string]interface{})
 		if !ok {
-			return fmt.Errorf("")
+			return fmt.Errorf("failed to assert type %T to map", elem)
 		}
 
 		v := reflect.New(outVal.Type().Elem()).Elem()
